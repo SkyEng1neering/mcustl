@@ -45,6 +45,17 @@ target_compile_definitions(mcustl_string PUBLIC
     MCUSTL_CUSTOM_CONF_FILE="mcustl_test_conf.h"
 )
 
+# mcustl json library (C++)
+add_library(mcustl_json STATIC ../src/mcustl_json.cpp)
+target_include_directories(mcustl_json PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../inc
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(mcustl_json PUBLIC mcustl_string mcustl_alloc)
+target_compile_definitions(mcustl_json PUBLIC
+    MCUSTL_CUSTOM_CONF_FILE="mcustl_test_conf.h"
+)
+
 # Test sources
 set(TEST_SOURCES
     test_vector.cpp
@@ -52,6 +63,7 @@ set(TEST_SOURCES
     test_smart_ptr.cpp
     test_list.cpp
     test_map.cpp
+    test_json.cpp
     test_integration.cpp
     test_advanced.cpp
 )
@@ -60,6 +72,7 @@ set(TEST_SOURCES
 add_executable(mcustl_tests ${TEST_SOURCES})
 find_package(Threads REQUIRED)
 target_link_libraries(mcustl_tests
+    mcustl_json
     mcustl_string
     mcustl_alloc
     GTest::gtest_main

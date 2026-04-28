@@ -87,4 +87,8 @@
 #include "mcustl_map.h"
 #endif
 
+#if MCUSTL_USE_JSON
+#include "mcustl_json.h"
+#endif
+
 #endif /* MCUSTL_H */

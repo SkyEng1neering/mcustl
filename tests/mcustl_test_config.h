@@ -12,7 +12,7 @@
 
 #include "mcustl.h"
 
-static constexpr size_t TEST_HEAP_SIZE = 8192;
+static constexpr size_t TEST_HEAP_SIZE = 65536;
 static constexpr size_t CANARY_SIZE = 64;
 static constexpr uint8_t CANARY_PATTERN = 0xCD;
 

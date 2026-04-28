@@ -37,6 +37,7 @@
  * - MCUSTL_USE_SMART_PTR: Enable mcustl::smart_ptr / mcustl::observer_ptr (default: enabled)
  * - MCUSTL_USE_LIST: Enable mcustl::list (default: enabled)
  * - MCUSTL_USE_MAP: Enable mcustl::map (default: enabled)
+ * - MCUSTL_USE_JSON: Enable mcustl::json (default: enabled, requires MAP+VECTOR+STRING)
  *
  * Allocator configuration:
  * - USE_SINGLE_HEAP_MEMORY (default: enabled)
@@ -67,7 +68,7 @@ extern "C" {
 /* ==================== Library Version ==================== */
 
 #ifndef MCUSTL_VERSION
-#define MCUSTL_VERSION                      "1.0.0"
+#define MCUSTL_VERSION                      "1.1.0"
 #endif
 
 /* ==================== Module Enable/Disable ==================== */
@@ -97,10 +98,19 @@ extern "C" {
 #define MCUSTL_USE_MAP                      1
 #endif
 
+/* Enable mcustl::json (depends on map + vector + string) */
+#ifndef MCUSTL_USE_JSON
+#define MCUSTL_USE_JSON                     1
+#endif
+
 /* ==================== Dependency Checks ==================== */
 
 #if MCUSTL_USE_STRING && !MCUSTL_USE_VECTOR
 #error "MCUSTL_USE_STRING requires MCUSTL_USE_VECTOR (string uses vector<char> internally)"
+#endif
+
+#if MCUSTL_USE_JSON && (!MCUSTL_USE_MAP || !MCUSTL_USE_VECTOR || !MCUSTL_USE_STRING)
+#error "MCUSTL_USE_JSON requires MCUSTL_USE_MAP, MCUSTL_USE_VECTOR and MCUSTL_USE_STRING"
 #endif
 
 /* ==================== Allocator Configuration ==================== */
@@ -298,6 +308,37 @@ extern "C" {
 #endif
 
 #endif /* MCUSTL_USE_MAP */
+
+/* ==================== JSON Configuration ==================== */
+
+#if MCUSTL_USE_JSON
+
+/* Enable JSON text parsing (json::parse). Disable to drop the parser code
+ * if you only need to construct/serialize JSON values programmatically. */
+#ifndef MCUSTL_USE_JSON_PARSER
+#define MCUSTL_USE_JSON_PARSER              1
+#endif
+
+/* Enable JSON serialization (json::dump). Disable to drop the dump code. */
+#ifndef MCUSTL_USE_JSON_DUMP
+#define MCUSTL_USE_JSON_DUMP                1
+#endif
+
+/* Enable double (number_float) support. When 0, only int64 numbers are
+ * supported — useful on MCUs without an FPU or to avoid pulling in soft
+ * float helpers. Float construction, get_float, parse of fractional/exp
+ * numbers, and dump of floats become unavailable. */
+#ifndef MCUSTL_JSON_USE_FLOAT
+#define MCUSTL_JSON_USE_FLOAT               1
+#endif
+
+/* Maximum nesting depth the parser will accept. Guards against stack
+ * overflow on attacker-controlled input. */
+#ifndef MCUSTL_JSON_MAX_DEPTH
+#define MCUSTL_JSON_MAX_DEPTH               64
+#endif
+
+#endif /* MCUSTL_USE_JSON */
 
 #ifdef __cplusplus
 }

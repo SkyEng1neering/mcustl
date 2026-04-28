@@ -2,7 +2,7 @@
 
 **Author:** Alexey Vasilenko  
 **License:** Apache 2.0  
-**Version:** 1.0.0
+**Version:** 1.1.0
 
 C++ container library for embedded systems (MCU, RTOS). All containers use the **dalloc** defragmenting memory allocator, which automatically compacts heap memory and updates tracked pointers. No standard library heap (`new`/`delete`/`malloc`) is used.
 
@@ -14,6 +14,7 @@ C++ container library for embedded systems (MCU, RTOS). All containers use the *
 | `mcustl::string` | mcustl_string.h | Dynamic string (backed by `vector<char>`) |
 | `mcustl::list<T>` | mcustl_list.h | Doubly-linked list, pool-based, index-linked |
 | `mcustl::map<K,V>` | mcustl_map.h | Sorted associative container, pool-based red-black tree |
+| `mcustl::json` | mcustl_json.h | nlohmann-style JSON value with parse / dump / object / array |
 | `mcustl::smart_ptr<T>` | mcustl_smart_ptr.h | Unique ownership smart pointer |
 | `mcustl::observer_ptr<T>` | mcustl_smart_ptr.h | Non-owning pointer wrapper |
 | `mcustl::pair<A,B>` | mcustl_pair.h | Lightweight pair template |
@@ -33,14 +34,12 @@ Do not include sub-headers directly.
 ```cpp
 #include "mcustl.h"
 
-// 1. Provide heap memory (global buffer, linker section, etc.)
+/* Provide a heap buffer (global, linker section, etc.). */
 static uint8_t heap_buf[16384];
 
 int main() {
-    // 2. Register heap before any container operations
     mcustl_register_heap(heap_buf, sizeof(heap_buf));
 
-    // 3. Use containers
     mcustl::vector<int> vec;
     vec.push_back(10);
     vec.push_back(20);
@@ -58,6 +57,11 @@ int main() {
 
     mcustl::smart_ptr<int> ptr;
     ptr.create(42);
+
+    mcustl::json cfg;
+    cfg["device"] = mcustl::json("exciter-mini");
+    cfg["volume"] = mcustl::json(75);
+    auto text = cfg.dump();
 
     return 0;
 }
@@ -95,6 +99,10 @@ The custom file is included **before** defaults, so any value you define will no
 #define MCUSTL_USE_LIST         0
 #define MCUSTL_USE_MAP          0
 
+/* Trim json: keep dumping/building values, drop the parser and floats */
+#define MCUSTL_USE_JSON_PARSER  0
+#define MCUSTL_JSON_USE_FLOAT   0
+
 /* Increase allocation limit for complex applications */
 #define MAX_NUM_OF_ALLOCATIONS  500UL
 
@@ -125,6 +133,11 @@ The custom file is included **before** defaults, so any value you define will no
 | `MCUSTL_USE_SMART_PTR` | `1` | Enable `mcustl::smart_ptr<T>`, `observer_ptr<T>` |
 | `MCUSTL_USE_LIST` | `1` | Enable `mcustl::list<T>` |
 | `MCUSTL_USE_MAP` | `1` | Enable `mcustl::map<K,V>` |
+| `MCUSTL_USE_JSON` | `1` | Enable `mcustl::json` (requires VECTOR + STRING + MAP) |
+| `MCUSTL_USE_JSON_PARSER` | `1` | Compile in `json::parse` (set 0 to drop parser code) |
+| `MCUSTL_USE_JSON_DUMP` | `1` | Compile in `json::dump` (set 0 to drop serializer code) |
+| `MCUSTL_JSON_USE_FLOAT` | `1` | Enable `double` numbers (set 0 on MCUs without FPU / soft-float) |
+| `MCUSTL_JSON_MAX_DEPTH` | `64` | Parser nesting limit (guards against stack-overflow on hostile input) |
 
 #### Allocator
 
@@ -476,6 +489,193 @@ mcustl::map<int, int> m4 = static_cast<mcustl::map<int, int>&&>(m);
 
 ---
 
+### mcustl::json
+
+Polymorphic JSON value with an `nlohmann::json`-style API. Holds one of: `null`, `bool`, `int64_t`, `double`, `mcustl::string`, `mcustl::vector<json>` (array), `mcustl::map<mcustl::string, json>` (object). Includes a hand-rolled recursive-descent parser and a serializer (both compile-time toggleable).
+
+The implementation depends on `mcustl::vector`, `mcustl::string` and `mcustl::map`, and respects the same heap rules as the rest of the library: every node carries a `heap_t*`, child elements inherit the parent's heap, and copies/moves migrate tracking through `replace_pointers` so defragmentation works transparently.
+
+No `<stdio.h>`, no `malloc`/`new`, no `strtod`/`strtoll` — only `dalloc` + placement-new and a few helpers from `<string.h>` (`memcpy`, `memcmp`, `strcmp`, `strlen`).
+
+**Complexity:**
+
+| Operation | Time |
+|---|---|
+| Scalar construction / type query / `get_*` | O(1) |
+| `operator[](const char*)` (object) | O(n) on first reference, O(n) on miss-then-insert |
+| `at(const char*)` / `contains` / `erase(key)` | O(n) |
+| `operator[](size_t)` / `at(size_t)` (array) | O(1) |
+| `push_back` (array) | O(1) amortized |
+| Equality (recursive) | O(n) over both trees |
+| `parse` | O(n) over input |
+| `dump` | O(n) over the tree, plus output size |
+
+(Object lookup is O(n) by design: it scans the underlying map by `strcmp` against `c_str()` so that callers do not need to materialize a heap-allocated `mcustl::string` key — a stack-allocated key would otherwise leave a dangling tracker entry when its lifetime ends mid-expression.)
+
+**API — construction:**
+
+```cpp
+mcustl::json a;                           /* null */
+mcustl::json b(nullptr);                  /* null */
+mcustl::json c(true);                     /* boolean */
+mcustl::json d(42);                       /* number_int */
+mcustl::json e(-7LL);
+mcustl::json f(3.14);                     /* number_float (if MCUSTL_JSON_USE_FLOAT) */
+mcustl::json g("hello");                  /* string from C-string */
+mcustl::json h(mcustl::string("world"));  /* string from mcustl::string */
+
+mcustl::json::array_t arr;
+arr.push_back(mcustl::json(1));
+arr.push_back(mcustl::json("x"));
+mcustl::json i(arr);                      /* array */
+
+mcustl::json::object_t obj;
+obj.insert(mcustl::string("k"), mcustl::json(1));
+mcustl::json j(obj);                      /* object */
+```
+
+**API — type queries and accessors:**
+
+```cpp
+j.type();                                 /* json::value_t::object | array | string | number_int | number_float | boolean | null */
+j.is_null();   j.is_boolean();
+j.is_number(); j.is_number_int(); j.is_number_float();
+j.is_string(); j.is_array(); j.is_object();
+
+j.size();                                 /* element count for containers, char count for string, 0 otherwise */
+j.empty();
+
+j.get_bool();                             /* asserts type is boolean */
+j.get_int();                              /* truncates from float if needed */
+j.get_float();                            /* coerces from int (only if MCUSTL_JSON_USE_FLOAT) */
+j.get_string();                           /* mcustl::string& */
+j.get_array();                            /* mcustl::vector<json>& */
+j.get_object();                           /* mcustl::map<mcustl::string, json>& */
+```
+
+**API — object operations:**
+
+```cpp
+mcustl::json cfg;                         /* starts as null */
+cfg["volume"] = mcustl::json(80);         /* auto-vivifies cfg into an object */
+cfg["mute"]   = mcustl::json(false);
+cfg["mode"];                              /* vivified as null */
+
+cfg.contains("volume");                   /* true */
+cfg.at("volume").get_int();               /* 80 */
+cfg.erase("mute");                        /* true; idempotent (returns false on missing key) */
+```
+
+**API — array operations:**
+
+```cpp
+mcustl::json log;
+log.push_back(mcustl::json("boot"));      /* turns null into an array on first push */
+log.push_back(mcustl::json(123));
+log.push_back(mcustl::json(3.14));
+
+log.size();                               /* 3 */
+log[0].get_string().c_str();              /* "boot" */
+log.at((size_t)1).get_int();              /* 123 */
+log.erase((size_t)0);                     /* shifts the rest down */
+```
+
+**API — iteration:**
+
+```cpp
+mcustl::json arr;
+for (int i = 0; i < 5; ++i) arr.push_back(mcustl::json(i));
+for (auto it = arr.begin(); it != arr.end(); ++it) {
+    int v = (int)it->get_int();
+    /* it.key() returns an empty string for arrays */
+}
+
+mcustl::json obj;
+obj["a"] = mcustl::json(1);
+obj["b"] = mcustl::json(2);
+for (auto it = obj.begin(); it != obj.end(); ++it) {
+    const auto& k = it.key();             /* mcustl::string&, sorted (map order) */
+    const auto& v = it.value();           /* json& */
+}
+```
+
+**API — equality:**
+
+```cpp
+mcustl::json(42) == mcustl::json(42);     /* true */
+mcustl::json(42) == mcustl::json(42.0);   /* true — int↔float numeric compare */
+mcustl::json("a") == mcustl::json("a");   /* true */
+
+mcustl::json a; a["k"] = mcustl::json(1);
+mcustl::json b; b["k"] = mcustl::json(1);
+a == b;                                   /* deep-compare, true */
+```
+
+**API — parse (gated by `MCUSTL_USE_JSON_PARSER`):**
+
+```cpp
+mcustl::json j = mcustl::json::parse("{\"name\":\"x\",\"vals\":[1,2,3]}");
+if (!j.is_null()) {
+    j.at("name").get_string();
+    j.at("vals")[0].get_int();
+}
+
+const char* err = nullptr;
+size_t      pos = 0;
+mcustl::json bad = mcustl::json::parse("{bad", nullptr, &err, &pos);
+if (bad.is_null() && err) {
+    /* err is a static C-string description, pos is the byte offset */
+}
+```
+
+The parser handles all of RFC 8259: integers (up to 18 digits stay in `int64_t`, larger numbers fall back to `double`), fractional / exponential numbers, escapes (`\n \t \r \b \f \" \\ \/`), `\uXXXX` with full UTF-16 surrogate pair → UTF-8 conversion, arbitrary nesting up to `MCUSTL_JSON_MAX_DEPTH`, and arbitrary whitespace.
+
+**API — dump (gated by `MCUSTL_USE_JSON_DUMP`):**
+
+```cpp
+mcustl::json j;
+j["name"] = mcustl::json("x");
+j["vals"] = mcustl::json();
+j["vals"].push_back(mcustl::json(1));
+j["vals"].push_back(mcustl::json(2));
+
+auto compact = j.dump();                  /* default indent=-1 */
+/* {"name":"x","vals":[1,2]} */
+
+auto pretty = j.dump(2);
+/* {
+ *   "name": "x",
+ *   "vals": [
+ *     1,
+ *     2
+ *   ]
+ * }
+ */
+```
+
+Object keys are emitted in sorted order (the underlying `mcustl::map` iterates ascending). Strings are escaped per RFC 8259, including control characters as `\u00XX`. Numbers are formatted by hand-rolled converters with no `printf`/`snprintf` dependency.
+
+**API — multi-heap and clone:**
+
+```cpp
+heap_t fast_heap, slow_heap;
+heap_init(&fast_heap, fast_buf, sizeof(fast_buf));
+heap_init(&slow_heap, slow_buf, sizeof(slow_buf));
+
+mcustl::json fast(&fast_heap);
+fast["t"] = mcustl::json(1);              /* child inherits fast_heap */
+
+mcustl::json migrated = fast.clone(&slow_heap);  /* deep copy onto slow_heap */
+```
+
+**Notes:**
+
+- `operator[](const char*)` mutates `null` into an `object` on first reference. To create an empty array instead, use `push_back`.
+- Returning a reference from `operator[]` is safe for the next single statement, but do not stash it across calls that may allocate (defragmentation can move the underlying map node).
+- All allocations are routed through `dalloc`. There is no fallback to system `malloc`.
+
+---
+
 ### mcustl::smart_ptr\<T\>
 
 Unique ownership smart pointer. Manages a single dalloc allocation. Non-copyable, move-only. Automatically destructs the managed object and frees memory.
@@ -704,6 +904,17 @@ mcustl::list<int> row;
 row.push_back(1);
 row.push_back(2);
 matrix.push_back(row);
+
+// json composes vector/string/map under the hood
+mcustl::json devices;
+for (int i = 0; i < 3; ++i) {
+    mcustl::json dev;
+    dev["id"]   = mcustl::json(i);
+    dev["name"] = mcustl::json("ch");
+    devices.push_back(dev);
+}
+auto wire = devices.dump();
+auto back = mcustl::json::parse(wire.c_str());
 ```
 
 ---
@@ -723,6 +934,7 @@ target_include_directories(your_target PRIVATE
 target_sources(your_target PRIVATE
     ${MCUSTL_DIR}/src/mcustl_alloc.c
     ${MCUSTL_DIR}/src/mcustl_string.cpp
+    ${MCUSTL_DIR}/src/mcustl_json.cpp     # only if MCUSTL_USE_JSON is enabled
 )
 
 # Custom configuration (optional)
@@ -731,9 +943,10 @@ target_compile_definitions(your_target PRIVATE
 )
 ```
 
-All containers except `string` are header-only templates. Only two source files need to be compiled:
+`vector`, `list`, `map`, `smart_ptr`, `pair` are header-only templates. The non-template parts that need a translation unit are:
 - `mcustl_alloc.c` -- allocator (C, always required)
-- `mcustl_string.cpp` -- string implementation (C++, only if `MCUSTL_USE_STRING` is enabled)
+- `mcustl_string.cpp` -- string implementation (only if `MCUSTL_USE_STRING` is enabled)
+- `mcustl_json.cpp` -- json implementation (only if `MCUSTL_USE_JSON` is enabled)
 
 ---
 
@@ -777,7 +990,7 @@ Practical approach: start with a generous buffer, enable `print_def_dalloc_info(
 
 ## Testing
 
-mcustl includes a comprehensive test suite (244 tests) using Google Test:
+mcustl includes a comprehensive test suite (338 tests) using Google Test:
 
 ```bash
 cd mcustl/tests

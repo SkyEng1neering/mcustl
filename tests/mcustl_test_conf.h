@@ -12,12 +12,16 @@
 #define MCUSTL_USE_SMART_PTR    1
 #define MCUSTL_USE_LIST         1
 #define MCUSTL_USE_MAP          1
+#define MCUSTL_USE_JSON         1
 
 /* Enable single heap for tests */
 #define USE_SINGLE_HEAP_MEMORY
 
 /* 8-byte alignment for 64-bit systems */
 #define ALLOCATION_ALIGNMENT_BYTES  8U
+
+/* Allow many allocations during JSON stress tests. */
+#define MAX_NUM_OF_ALLOCATIONS  500UL
 
 /* Zero memory on free */
 #define FILL_FREED_MEMORY_BY_NULLS  true
