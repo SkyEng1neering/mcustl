@@ -152,6 +152,13 @@ void json::destroy_payload() {
      * inner destructor call. The stack-local survives any further defrag,
      * so the matching dfree always succeeds.
      */
+    /* Each owning case follows: transplant the s_/a_/o_ tracker to a
+     * stack-local via replace_pointers, then run the inner destructor
+     * + dfree on the local. If the tracker was already dropped by a
+     * prior defrag's orphan-removal (i.e. the containing struct holding
+     * &this->X was freed and its inner trackers were swept), the local
+     * stays nullptr; skip cleanup — that payload was already accounted
+     * for when the parent block was freed. */
     switch (type_) {
         case value_t::string:
             if (s_) {
@@ -166,13 +173,15 @@ void json::destroy_payload() {
                 else       def_replace_pointers(reinterpret_cast<void**>(&s_),
                                                 reinterpret_cast<void**>(&local_s));
 #endif
-                local_s->~string_t();
+                if (local_s) {
+                    local_s->~string_t();
 #ifdef USE_SINGLE_HEAP_MEMORY
-                def_dfree(reinterpret_cast<void**>(&local_s));
+                    def_dfree(reinterpret_cast<void**>(&local_s));
 #else
-                if (heap_) dfree(heap_, reinterpret_cast<void**>(&local_s), USING_PTR_ADDRESS);
-                else       def_dfree(reinterpret_cast<void**>(&local_s));
+                    if (heap_) dfree(heap_, reinterpret_cast<void**>(&local_s), USING_PTR_ADDRESS);
+                    else       def_dfree(reinterpret_cast<void**>(&local_s));
 #endif
+                }
             }
             break;
         case value_t::array:
@@ -188,13 +197,15 @@ void json::destroy_payload() {
                 else       def_replace_pointers(reinterpret_cast<void**>(&a_),
                                                 reinterpret_cast<void**>(&local_a));
 #endif
-                local_a->~array_t();
+                if (local_a) {
+                    local_a->~array_t();
 #ifdef USE_SINGLE_HEAP_MEMORY
-                def_dfree(reinterpret_cast<void**>(&local_a));
+                    def_dfree(reinterpret_cast<void**>(&local_a));
 #else
-                if (heap_) dfree(heap_, reinterpret_cast<void**>(&local_a), USING_PTR_ADDRESS);
-                else       def_dfree(reinterpret_cast<void**>(&local_a));
+                    if (heap_) dfree(heap_, reinterpret_cast<void**>(&local_a), USING_PTR_ADDRESS);
+                    else       def_dfree(reinterpret_cast<void**>(&local_a));
 #endif
+                }
             }
             break;
         case value_t::object:
@@ -210,13 +221,15 @@ void json::destroy_payload() {
                 else       def_replace_pointers(reinterpret_cast<void**>(&o_),
                                                 reinterpret_cast<void**>(&local_o));
 #endif
-                local_o->~object_t();
+                if (local_o) {
+                    local_o->~object_t();
 #ifdef USE_SINGLE_HEAP_MEMORY
-                def_dfree(reinterpret_cast<void**>(&local_o));
+                    def_dfree(reinterpret_cast<void**>(&local_o));
 #else
-                if (heap_) dfree(heap_, reinterpret_cast<void**>(&local_o), USING_PTR_ADDRESS);
-                else       def_dfree(reinterpret_cast<void**>(&local_o));
+                    if (heap_) dfree(heap_, reinterpret_cast<void**>(&local_o), USING_PTR_ADDRESS);
+                    else       def_dfree(reinterpret_cast<void**>(&local_o));
 #endif
+                }
             }
             break;
         default:

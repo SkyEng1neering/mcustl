@@ -430,11 +430,18 @@ vector<T>::~vector(){
         T* saved_data = NULL;
         replace_pointers(saved_heap, (void**)&container_ptr, (void**)&saved_data);
 
-        for(uint32_t i = 0; i < saved_cap; i++){
-            saved_data[i].~T();
-        }
+        /* Guard: a prior defrag may have orphan-removed this vector's
+         * tracker (e.g. the containing struct was freed, dropping all
+         * inner trackers). In that case replace_pointers can't find
+         * &container_ptr, leaves saved_data NULL; the buffer's already
+         * gone with the freed parent. Skip — never deref NULL. */
+        if (saved_data != NULL) {
+            for(uint32_t i = 0; i < saved_cap; i++){
+                saved_data[i].~T();
+            }
 
-        dfree(saved_heap, (void**)&saved_data, USING_PTR_ADDRESS);
+            dfree(saved_heap, (void**)&saved_data, USING_PTR_ADDRESS);
+        }
 
         heap_unlock(saved_heap);
     }

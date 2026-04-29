@@ -304,50 +304,106 @@ static bool is_ptr_address_in_heap_area(heap_t* heap_struct_ptr, void **ptr){
     return false;
 }
 
+/*
+ * Defragmentation handles three independent updates per freed block:
+ *
+ *   1. Orphan trackers — entries whose user-pointer-variable (.ptr) lives
+ *      INSIDE the block being freed. Such trackers were members of a
+ *      heap-allocated struct that's now gone (e.g. `&map.nodes_` is
+ *      stored at `map_struct_addr + offsetof(nodes_)` — when we free the
+ *      map struct, `&nodes_` is no longer a valid storage location).
+ *      These are REMOVED, not shifted: shifting would point them into
+ *      a neighbouring allocation's bytes, which is the historical bug
+ *      that caused mysterious "Can't replace pointers" / use-after-free
+ *      patterns in destructors.
+ *
+ *   2. Surviving tracker addresses — trackers whose .ptr lives in heap
+ *      ABOVE the freed block. These addresses shift down by alloc_size
+ *      to follow the memmove of their containing struct.
+ *
+ *   3. Pointer values — for ALL surviving trackers, if the value of the
+ *      user pointer (i.e. `*tracker.ptr`) was at a heap address above
+ *      the freed block, shift it down. This covers the case where a
+ *      tracker's STORAGE didn't move (e.g. a stack-local) but the BLOCK
+ *      it points to was relocated.
+ */
 static void defrag_memory(heap_t* heap_struct_ptr){
     for(uint32_t i = 0; i < heap_struct_ptr->alloc_info.allocations_num; i++){
-        if(heap_struct_ptr->alloc_info.ptr_info_arr[i].free_flag == true){
-            uint8_t *start_mem_ptr = *(heap_struct_ptr->alloc_info.ptr_info_arr[i].ptr);
-            uint32_t start_ind = (uint32_t)(start_mem_ptr - heap_struct_ptr->mem);
+        if(heap_struct_ptr->alloc_info.ptr_info_arr[i].free_flag != true){
+            continue;
+        }
 
-            *(heap_struct_ptr->alloc_info.ptr_info_arr[i].ptr) = NULL;
+        uint8_t *start_mem_ptr = *(heap_struct_ptr->alloc_info.ptr_info_arr[i].ptr);
+        uint32_t start_ind = (uint32_t)(start_mem_ptr - heap_struct_ptr->mem);
 
-            uint32_t alloc_size = heap_struct_ptr->alloc_info.ptr_info_arr[i].allocated_size;
+        *(heap_struct_ptr->alloc_info.ptr_info_arr[i].ptr) = NULL;
+
+        uint32_t alloc_size = heap_struct_ptr->alloc_info.ptr_info_arr[i].allocated_size;
 #ifdef USE_ALIGNMENT
-            alloc_size = MCUSTL_ALIGN_UP(alloc_size);
+        alloc_size = MCUSTL_ALIGN_UP(alloc_size);
 #endif
-            for(uint32_t k = 0; k < heap_struct_ptr->alloc_info.allocations_num; k++){
-                if(k == i) continue;
-                if(is_ptr_address_in_heap_area(heap_struct_ptr, (void**)heap_struct_ptr->alloc_info.ptr_info_arr[k].ptr)){
-                    if((size_t)heap_struct_ptr->alloc_info.ptr_info_arr[k].ptr > (size_t)(start_mem_ptr)){
-                        heap_struct_ptr->alloc_info.ptr_info_arr[k].ptr = (uint8_t**)((size_t)(heap_struct_ptr->alloc_info.ptr_info_arr[k].ptr) - alloc_size);
-                    }
+        size_t blk_lo = (size_t)start_mem_ptr;
+        size_t blk_hi = blk_lo + alloc_size;
+
+        /* Step 1: drop orphan trackers (their storage was inside the
+         * freed block). Walk in-place from the end so removals don't
+         * disturb the index we're about to inspect. */
+        uint32_t k = heap_struct_ptr->alloc_info.allocations_num;
+        while (k > 0) {
+            --k;
+            if (k == i) continue;
+            size_t kp = (size_t)heap_struct_ptr->alloc_info.ptr_info_arr[k].ptr;
+            if (kp >= blk_lo && kp < blk_hi) {
+                /* Orphan — slide tail of the array down one slot. */
+                for (uint32_t kk = k; kk < heap_struct_ptr->alloc_info.allocations_num - 1; ++kk) {
+                    heap_struct_ptr->alloc_info.ptr_info_arr[kk] =
+                        heap_struct_ptr->alloc_info.ptr_info_arr[kk + 1];
+                }
+                heap_struct_ptr->alloc_info.allocations_num--;
+                /* The freed entry's index `i` may shift if the orphan
+                 * was BEFORE it. Compensate so the outer remove (step
+                 * 5) still targets the right slot. */
+                if (k < i) i--;
+            }
+        }
+
+        /* Step 2: shift tracker storage addresses for entries whose
+         * .ptr was in heap and ABOVE the freed block. */
+        for(uint32_t k2 = 0; k2 < heap_struct_ptr->alloc_info.allocations_num; k2++){
+            if(k2 == i) continue;
+            if(is_ptr_address_in_heap_area(heap_struct_ptr, (void**)heap_struct_ptr->alloc_info.ptr_info_arr[k2].ptr)){
+                if((size_t)heap_struct_ptr->alloc_info.ptr_info_arr[k2].ptr > blk_lo){
+                    heap_struct_ptr->alloc_info.ptr_info_arr[k2].ptr = (uint8_t**)((size_t)(heap_struct_ptr->alloc_info.ptr_info_arr[k2].ptr) - alloc_size);
                 }
             }
+        }
 
-            uint32_t bytes_to_move = heap_struct_ptr->offset - start_ind - alloc_size;
-            memmove(heap_struct_ptr->mem + start_ind,
-                    heap_struct_ptr->mem + start_ind + alloc_size,
-                    bytes_to_move);
+        /* Step 3: memmove the data down. */
+        uint32_t bytes_to_move = heap_struct_ptr->offset - start_ind - alloc_size;
+        memmove(heap_struct_ptr->mem + start_ind,
+                heap_struct_ptr->mem + start_ind + alloc_size,
+                bytes_to_move);
 
-            for(uint32_t k = 0; k < heap_struct_ptr->alloc_info.allocations_num; k++){
-                if(k == i) continue;
-                if(*(heap_struct_ptr->alloc_info.ptr_info_arr[k].ptr) > start_mem_ptr){
-                    *(heap_struct_ptr->alloc_info.ptr_info_arr[k].ptr) -= alloc_size;
-                }
+        /* Step 4: shift VALUES of remaining trackers that pointed past
+         * the freed block. */
+        for(uint32_t k3 = 0; k3 < heap_struct_ptr->alloc_info.allocations_num; k3++){
+            if(k3 == i) continue;
+            if(*(heap_struct_ptr->alloc_info.ptr_info_arr[k3].ptr) > start_mem_ptr){
+                *(heap_struct_ptr->alloc_info.ptr_info_arr[k3].ptr) -= alloc_size;
             }
+        }
 
-            for(uint32_t k = i; k < heap_struct_ptr->alloc_info.allocations_num - 1; k++){
-                heap_struct_ptr->alloc_info.ptr_info_arr[k] = heap_struct_ptr->alloc_info.ptr_info_arr[k + 1];
-            }
+        /* Step 5: remove the freed entry itself. */
+        for(uint32_t k4 = i; k4 < heap_struct_ptr->alloc_info.allocations_num - 1; k4++){
+            heap_struct_ptr->alloc_info.ptr_info_arr[k4] = heap_struct_ptr->alloc_info.ptr_info_arr[k4 + 1];
+        }
 
-            heap_struct_ptr->alloc_info.allocations_num--;
-            heap_struct_ptr->offset = heap_struct_ptr->offset - alloc_size;
+        heap_struct_ptr->alloc_info.allocations_num--;
+        heap_struct_ptr->offset = heap_struct_ptr->offset - alloc_size;
 
 #if FILL_FREED_MEMORY_BY_NULLS
-            memset(heap_struct_ptr->mem + heap_struct_ptr->offset, 0, alloc_size);
+        memset(heap_struct_ptr->mem + heap_struct_ptr->offset, 0, alloc_size);
 #endif
-        }
     }
 }
 

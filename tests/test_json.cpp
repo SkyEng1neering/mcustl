@@ -599,3 +599,284 @@ TEST_F(McustlTestFixture, JsonParseDeviceConfigShape) {
     EXPECT_EQ(seen_name, 1)      << "streams[0] iteration didn't see \"name\"";
     EXPECT_EQ(seen_modifiers, 1) << "streams[0] iteration didn't see \"modifiers\"";
 }
+
+/* The exciter-mini SystemConfig::dumpParsed() walks the parsed root with
+ * the heap mutex held and prints `it.key()` / `it.value()` for every
+ * top-level object key. On the device this path observed empty key
+ * strings whose size_val matched the original key's length but whose
+ * char buffer was zeroed — i.e. the tracker for the key string was
+ * pointing at memory that had been freed/reused by a later allocation.
+ * This test mimics that exact walk and asserts every key is intact. */
+TEST_F(McustlTestFixture, JsonParseDeviceConfigShape_IteratorWalk) {
+    const char* text =
+        "{\n"
+        "  \"streams\": [\n"
+        "    {\n"
+        "      \"name\": \"speaker\",\n"
+        "      \"modifiers\": [\n"
+        "        \"pitch_down\"\n"
+        "      ]\n"
+        "    }\n"
+        "  ],\n"
+        "  \"stream_connections\": [\n"
+        "    {\n"
+        "      \"input\": \"usb_in\",\n"
+        "      \"output\": \"speaker\"\n"
+        "    }\n"
+        "  ]\n"
+        "}";
+
+    json j = json::parse(text, strlen(text));
+    ASSERT_TRUE(j.is_object());
+
+    /* Walk every level via iterator, reading key().c_str() each time
+     * — exactly the device's failure mode. */
+    {
+        mcustl::heap_guard g;
+        int top_keys = 0;
+        for (auto it = j.begin(); it != j.end(); ++it) {
+            const auto& k = it.key();
+            ++top_keys;
+            EXPECT_GT(k.size(), 0u) << "top-level key has size 0";
+            ASSERT_NE(k.c_str(), nullptr);
+            EXPECT_NE(k.c_str()[0], '\0') << "top-level key starts with NUL";
+            const auto& v = it.value();
+            ASSERT_TRUE(v.is_array()) << "top key \"" << k.c_str() << "\" not array";
+            for (size_t i = 0; i < v.size(); ++i) {
+                const json& e = v[i];
+                ASSERT_TRUE(e.is_object());
+                int inner_keys = 0;
+                for (auto eit = e.begin(); eit != e.end(); ++eit) {
+                    const auto& ek = eit.key();
+                    ++inner_keys;
+                    /* The exact failure mode — key has correct size_val
+                     * but buffer is zeroed. Catch it with an explicit
+                     * check, not just c_str()[0]. */
+                    EXPECT_GT(ek.size(), 0u) << "inner key size 0";
+                    bool any_nz = false;
+                    for (uint32_t b = 0; b < ek.size(); ++b) {
+                        if (ek.c_str()[b] != '\0') { any_nz = true; break; }
+                    }
+                    EXPECT_TRUE(any_nz)
+                        << "inner key buffer is all zeros (size=" << ek.size() << ")";
+                }
+                EXPECT_EQ(inner_keys, 2) << "expected exactly 2 inner keys per entry";
+            }
+        }
+        EXPECT_EQ(top_keys, 2);
+    }
+}
+
+/* Granular dump after parse: at every level, verify type + size.
+ * Pinpoints which exact accessor returns a corrupt result. */
+TEST_F(McustlTestFixture, JsonParseDeviceConfigShape_GranularInspect) {
+    const char* text =
+        "{\"streams\":[{\"name\":\"speaker\",\"modifiers\":[\"pitch_down\"]}],"
+        "\"stream_connections\":[{\"input\":\"usb_in\",\"output\":\"speaker\"}]}";
+
+    json j = json::parse(text, strlen(text));
+    ASSERT_TRUE(j.is_object());
+    ASSERT_EQ(j.size(), 2u);
+
+    /* Level 1: top-level object keys. */
+    ASSERT_TRUE(j.contains("stream_connections"));
+    const json& cons_arr = j.at("stream_connections");
+    ASSERT_TRUE(cons_arr.is_array());
+    ASSERT_EQ(cons_arr.size(), 1u);
+
+    /* Level 2: connections[0]. */
+    const json& c0 = cons_arr[0];
+    ASSERT_TRUE(c0.is_object());
+    ASSERT_EQ(c0.size(), 2u);
+    ASSERT_TRUE(c0.contains("input"));
+
+    /* Level 3: connection[0]["input"]. */
+    const json& input_node = c0.at("input");
+    ASSERT_TRUE(input_node.is_string());
+
+    /* Level 4: get_string() returns the string struct reference. */
+    const mcustl::string& input_str = input_node.get_string();
+
+    /* CRITICAL CHECKPOINT: is the string struct valid here? */
+    fprintf(stderr, "  &input_str=%p\n", (const void*)&input_str);
+    fprintf(stderr, "  input_str.size()=%u\n", (unsigned)input_str.size());
+    fprintf(stderr, "  input_str.c_str()=%p\n", (void*)input_str.c_str());
+
+    /* Dump first 16 bytes of the buffer pointed to by c_str(). If
+     * the buffer is "usb_in\0..." then size_val is wrong but data
+     * is correct. If buffer is zeros, the buffer too is wiped. */
+    if (input_str.c_str()) {
+        fprintf(stderr, "  buffer content (16 bytes): ");
+        for (int b = 0; b < 16; ++b) {
+            fprintf(stderr, "%02x ", (unsigned)(unsigned char)input_str.c_str()[b]);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    /* Dump the string struct's raw bytes (sizeof string ~32). */
+    fprintf(stderr, "  string struct raw bytes: ");
+    const unsigned char* sb = (const unsigned char*)&input_str;
+    for (int b = 0; b < 32; ++b) {
+        fprintf(stderr, "%02x ", sb[b]);
+    }
+    fprintf(stderr, "\n");
+
+    EXPECT_EQ(input_str.size(), 6u);
+    EXPECT_STREQ(input_str.c_str(), "usb_in");
+}
+
+/* Same as above but WITH heap_guard. */
+TEST_F(McustlTestFixture, JsonParseDeviceConfigShape_StringCopyOnlyConnections) {
+    const char* text =
+        "{\"streams\":[{\"name\":\"speaker\",\"modifiers\":[\"pitch_down\"]}],"
+        "\"stream_connections\":[{\"input\":\"usb_in\",\"output\":\"speaker\"}]}";
+
+    json j = json::parse(text, strlen(text));
+    ASSERT_TRUE(j.is_object());
+
+    {
+        mcustl::heap_guard g;
+        const json& c0 = j.at("stream_connections")[0];
+
+        EXPECT_EQ(c0.at("input").get_string().size(), 6u);
+        EXPECT_STREQ(c0.at("input").get_string().c_str(), "usb_in");
+
+        mcustl::string input_copy  = c0.at("input").get_string();
+        mcustl::string output_copy = c0.at("output").get_string();
+        EXPECT_STREQ(input_copy.c_str(),  "usb_in");
+        EXPECT_STREQ(output_copy.c_str(), "speaker");
+    }
+}
+
+/* Mimics SystemConfig::applyToStreams(): walks parsed json and copies
+ * key/value strings into mcustl::string locals (which is what the
+ * device does to keep the data alive across foreign defrag). The bug
+ * surface: after the copy, the stored strings should match the source. */
+TEST_F(McustlTestFixture, JsonParseDeviceConfigShape_StringCopyOut) {
+    const char* text =
+        "{\"streams\":[{\"name\":\"speaker\",\"modifiers\":[\"pitch_down\"]}],"
+        "\"stream_connections\":[{\"input\":\"usb_in\",\"output\":\"speaker\"}]}";
+
+    json j = json::parse(text, strlen(text));
+    ASSERT_TRUE(j.is_object());
+
+    /* For each stream entry: copy "name" and each modifier into local
+     * mcustl::string. Then check the copies are intact. The device
+     * applyToStreams does this same copy under heap_guard before
+     * passing c_str() to subsystem APIs. */
+    {
+        mcustl::heap_guard g;
+        const json& streams = j.at("streams");
+        ASSERT_TRUE(streams.is_array());
+        ASSERT_EQ(streams.size(), 1u);
+
+        const json& s0 = streams[0];
+        ASSERT_TRUE(s0.is_object());
+        ASSERT_TRUE(s0.contains("name"));
+        ASSERT_TRUE(s0.at("name").is_string());
+
+        mcustl::string name_copy = s0.at("name").get_string();
+        EXPECT_EQ(name_copy.size(), 7u);
+        EXPECT_STREQ(name_copy.c_str(), "speaker");
+
+        ASSERT_TRUE(s0.contains("modifiers"));
+        const json& mods = s0.at("modifiers");
+        ASSERT_TRUE(mods.is_array());
+        mcustl::string mod_copy = mods[0].get_string();
+        EXPECT_EQ(mod_copy.size(), 10u);
+        EXPECT_STREQ(mod_copy.c_str(), "pitch_down");
+    }
+
+    {
+        mcustl::heap_guard g;
+        const json& cons = j.at("stream_connections");
+        ASSERT_TRUE(cons.is_array());
+        ASSERT_EQ(cons.size(), 1u);
+
+        const json& c0 = cons[0];
+
+        /* Read source state BEFORE copy. If these aren't 6/usb_in here,
+         * the parsed json itself is broken — not the copy mechanism. */
+        ASSERT_TRUE(c0.at("input").is_string());
+        EXPECT_EQ(c0.at("input").get_string().size(), 6u) << "source input size wrong before copy";
+        EXPECT_STREQ(c0.at("input").get_string().c_str(), "usb_in") << "source input data wrong before copy";
+
+        mcustl::string input_copy  = c0.at("input").get_string();
+        mcustl::string output_copy = c0.at("output").get_string();
+
+        EXPECT_EQ(input_copy.size(), 6u);
+        EXPECT_STREQ(input_copy.c_str(), "usb_in");
+        EXPECT_EQ(output_copy.size(), 7u);
+        EXPECT_STREQ(output_copy.c_str(), "speaker");
+    }
+}
+
+/* On the embedded target the heap is non-empty when SystemConfig::load()
+ * runs — other tasks have already allocated buffers. This test
+ * pre-fragments the heap by allocating + freeing varied sizes before
+ * parsing, to push parse-time allocations into a non-trivial heap
+ * state and surface allocator/defrag interactions that a fresh-heap
+ * test would miss. */
+TEST_F(McustlTestFixture, JsonParseDeviceConfigShape_FragmentedHeap) {
+    /* Pre-fragment: allocate several tracked blocks via mcustl::string
+     * (keeps trackers registered), free a subset to leave gaps. */
+    {
+        mcustl::string keep1(128);
+        mcustl::string drop1(64);
+        mcustl::string keep2(256);
+        mcustl::string drop2(96);
+        mcustl::string keep3(192);
+        /* drop1 / drop2 leave heap (as locals), creating gaps. */
+        (void)drop1; (void)drop2;
+    }
+    /* Persist some other allocations so the heap stays partially used. */
+    mcustl::string persistent(512);
+
+    const char* text =
+        "{\"streams\":[{\"name\":\"speaker\",\"modifiers\":[\"pitch_down\"]}],"
+        "\"stream_connections\":[{\"input\":\"usb_in\",\"output\":\"speaker\"}]}";
+
+    json j = json::parse(text, strlen(text));
+    ASSERT_TRUE(j.is_object());
+
+    /* Now do the same iterator walk under heap_guard. */
+    mcustl::heap_guard g;
+    int found_correct_keys = 0;
+    for (auto it = j.begin(); it != j.end(); ++it) {
+        const auto& k = it.key();
+        if (k.size() == 7 && memcmp(k.c_str(), "streams", 7) == 0) ++found_correct_keys;
+        if (k.size() == 18 && memcmp(k.c_str(), "stream_connections", 18) == 0) ++found_correct_keys;
+    }
+    EXPECT_EQ(found_correct_keys, 2);
+
+    const json& s0 = j.at("streams")[0];
+    EXPECT_STREQ(s0.at("name").get_string().c_str(), "speaker");
+    EXPECT_STREQ(s0.at("modifiers")[0].get_string().c_str(), "pitch_down");
+
+    const json& c0 = j.at("stream_connections")[0];
+    EXPECT_STREQ(c0.at("input").get_string().c_str(), "usb_in");
+    EXPECT_STREQ(c0.at("output").get_string().c_str(), "speaker");
+
+    EXPECT_GT(persistent.capacity(), 0u);
+}
+
+/* Repeat the parse + walk many times in the same heap. Cumulative
+ * defrag activity may expose timing-dependent issues that a single
+ * parse misses. Mimics a long-running device that re-loads config. */
+TEST_F(McustlTestFixture, JsonParseDeviceConfigShape_RepeatedParseLoop) {
+    const char* text =
+        "{\"streams\":[{\"name\":\"speaker\",\"modifiers\":[\"pitch_down\"]}],"
+        "\"stream_connections\":[{\"input\":\"usb_in\",\"output\":\"speaker\"}]}";
+
+    for (int round = 0; round < 50; ++round) {
+        json j = json::parse(text, strlen(text));
+        ASSERT_TRUE(j.is_object()) << "round " << round;
+
+        mcustl::heap_guard g;
+        ASSERT_TRUE(j.at("streams")[0].at("name").is_string()) << "round " << round;
+        EXPECT_STREQ(j.at("streams")[0].at("name").get_string().c_str(), "speaker")
+            << "round " << round;
+        EXPECT_STREQ(j.at("stream_connections")[0].at("input").get_string().c_str(), "usb_in")
+            << "round " << round;
+    }
+}

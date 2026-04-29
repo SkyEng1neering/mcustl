@@ -965,11 +965,20 @@ map<K,V>::~map() {
         Node* saved_nodes = NULL;
         replace_pointers(saved_heap, (void**)&nodes_, (void**)&saved_nodes);
 
-        for (uint32_t i = 0; i < saved_cap; i++) {
-            ((Node*)((size_t)saved_nodes + i * sizeof(Node)))->kv.~value_type();
-        }
+        /* Guard: if the tracker for &nodes_ was already removed by a
+         * prior defrag's orphan-removal (e.g. the parent struct holding
+         * &this->nodes_ was freed separately and its inner trackers
+         * were dropped), `replace_pointers` returns without writing
+         * `saved_nodes`. Skip cleanup — the buffer either was already
+         * recycled by defrag's orphan path or will be reclaimed when
+         * the parent dfree completes. Never dereference NULL. */
+        if (saved_nodes != NULL) {
+            for (uint32_t i = 0; i < saved_cap; i++) {
+                ((Node*)((size_t)saved_nodes + i * sizeof(Node)))->kv.~value_type();
+            }
 
-        dfree(saved_heap, (void**)&saved_nodes, USING_PTR_ADDRESS);
+            dfree(saved_heap, (void**)&saved_nodes, USING_PTR_ADDRESS);
+        }
 
         heap_unlock(saved_heap);
     }
