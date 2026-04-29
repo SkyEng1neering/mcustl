@@ -91,4 +91,7 @@
 #include "mcustl_json.h"
 #endif
 
+/* RAII heap mutex guard — always available, no module dependency */
+#include "mcustl_guard.h"
+
 #endif /* MCUSTL_H */

@@ -518,3 +518,84 @@ TEST_F(McustlTestFixture, JsonReassignmentReleasesOldPayload) {
     EXPECT_TRUE(j.is_null());
     /* No leak — fixture cross-checks. */
 }
+
+/* ==================== Device-config-shaped repro ==================== */
+
+/* Reproduces a corruption pattern observed on a Cortex-M7 target: parsing
+ * the same JSON the device uses for its config produced an object where the
+ * FIRST key/value of the nested object lost its key data (size preserved,
+ * bytes zeroed), while later keys/values stayed intact. The hypothesis is
+ * that something inside map::insert dereferences a pointer into the node
+ * storage that gets relocated by a defrag triggered mid-assignment. This
+ * test exercises the exact JSON shape under whatever ALLOCATION_ALIGNMENT
+ * the test config uses, so a CI run with align=32 catches it. */
+TEST_F(McustlTestFixture, JsonParseDeviceConfigShape) {
+    const char* text =
+        "{\n"
+        "  \"streams\": [\n"
+        "    {\n"
+        "      \"name\": \"speaker\",\n"
+        "      \"modifiers\": [\n"
+        "        \"pitch_down\"\n"
+        "      ]\n"
+        "    }\n"
+        "  ],\n"
+        "  \"stream_connections\": [\n"
+        "    {\n"
+        "      \"input\": \"usb_in\",\n"
+        "      \"output\": \"speaker\"\n"
+        "    }\n"
+        "  ]\n"
+        "}";
+
+    json j = json::parse(text, strlen(text));
+    ASSERT_FALSE(j.is_null());
+    ASSERT_TRUE(j.is_object());
+
+    /* Top-level keys present and pointing at arrays of size 1. */
+    ASSERT_TRUE(j.contains("streams"));
+    ASSERT_TRUE(j.contains("stream_connections"));
+
+    const json& streams = j.at("streams");
+    ASSERT_TRUE(streams.is_array());
+    ASSERT_EQ(streams.size(), 1u);
+
+    const json& s0 = streams[0];
+    ASSERT_TRUE(s0.is_object());
+    /* The bug surfaces here on the device: contains("name") returned true
+     * but at("name").is_string() was false because the key buffer had been
+     * zeroed.  Both checks must hold. */
+    ASSERT_TRUE(s0.contains("name"))     << "streams[0].name key missing";
+    ASSERT_TRUE(s0.at("name").is_string()) << "streams[0].name not a string";
+    EXPECT_STREQ(s0.at("name").get_string().c_str(), "speaker");
+
+    ASSERT_TRUE(s0.contains("modifiers"));
+    ASSERT_TRUE(s0.at("modifiers").is_array());
+    ASSERT_EQ(s0.at("modifiers").size(), 1u);
+    EXPECT_STREQ(s0.at("modifiers")[0].get_string().c_str(), "pitch_down");
+
+    /* The second device-side symptom: connection.input was an EMPTY string. */
+    const json& cons = j.at("stream_connections");
+    ASSERT_TRUE(cons.is_array());
+    ASSERT_EQ(cons.size(), 1u);
+
+    const json& c0 = cons[0];
+    ASSERT_TRUE(c0.contains("input"));
+    ASSERT_TRUE(c0.at("input").is_string());
+    EXPECT_STREQ(c0.at("input").get_string().c_str(), "usb_in")
+        << "connection.input was empty on device — repro";
+
+    ASSERT_TRUE(c0.contains("output"));
+    EXPECT_STREQ(c0.at("output").get_string().c_str(), "speaker");
+
+    /* Iterate the inner object and verify every key has the right
+     * size+bytes (the failure mode: klen correct, bytes zero). */
+    int seen_name = 0, seen_modifiers = 0;
+    for (auto it = s0.begin(); it != s0.end(); ++it) {
+        const auto& k = it.key();
+        if (k.size() == 4 && memcmp(k.c_str(), "name", 4) == 0)      ++seen_name;
+        if (k.size() == 9 && memcmp(k.c_str(), "modifiers", 9) == 0) ++seen_modifiers;
+    }
+    EXPECT_EQ(seen_name, 1)      << "streams[0] iteration didn't see \"name\"";
+    EXPECT_EQ(seen_modifiers, 1) << "streams[0] iteration didn't see \"modifiers\"";
+}

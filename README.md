@@ -18,6 +18,7 @@ C++ container library for embedded systems (MCU, RTOS). All containers use the *
 | `mcustl::smart_ptr<T>` | mcustl_smart_ptr.h | Unique ownership smart pointer |
 | `mcustl::observer_ptr<T>` | mcustl_smart_ptr.h | Non-owning pointer wrapper |
 | `mcustl::pair<A,B>` | mcustl_pair.h | Lightweight pair template |
+| `mcustl::heap_guard` | mcustl_guard.h | RAII guard for atomic multi-step heap reads |
 
 All components are accessed through a single header:
 
@@ -755,6 +756,67 @@ auto obs3 = mcustl::make_observer(&x);
 obs.get();                   // int*
 if (obs) { /* non-null */ }
 obs.reset();                 // set to null
+```
+
+---
+
+### mcustl::heap_guard
+
+RAII wrapper that holds the heap's recursive mutex for the lifetime of its scope. Use it to bracket multi-step reads from tracked containers / json against concurrent allocator activity in other threads.
+
+**When you need it.** mcustl's thread safety guarantees that each *individual* `dalloc`/`dfree` call is atomic and that registered `data_` slots are correctly updated after defragmentation. It does **not** protect a sequence like:
+
+```cpp
+const char* p = some_str.c_str();   // reads data_, returns its current value
+// — another thread dfree's something here, defrag relocates blocks —
+memcpy(dst, p, n);                  // p still holds the OLD address → UB
+```
+
+The tracker only updates the `data_` slot of `some_str` after defrag — your local variable `p` is invisible to it. heap_guard plugs that hole by holding the heap mutex across the whole read+use sequence; foreign threads block on their own `dalloc`/`dfree` until you release.
+
+The mutex is recursive (FreeRTOS recursive semaphore / pthread `PTHREAD_MUTEX_RECURSIVE`), so calls to mcustl operations that take the same lock internally (`push_back`, `insert`, `dfree`, etc.) re-enter cleanly.
+
+**API:**
+
+```cpp
+{
+    mcustl::heap_guard g;        // single-heap mode: locks default heap
+    const char* name = j.at("name").get_string().c_str();
+    memcpy(buf, name, len);      // foreign defrag cannot run here
+}                                 // g destructs → unlock on scope exit
+
+{
+    mcustl::heap_guard g(my_heap);   // multi-heap or by-pointer
+    /* … */
+}
+```
+
+Prefer the smallest possible scope. Hold only across the steps that actually need atomicity (typically: walk the json + copy strings to stack buffers); release before doing heavy work like creating modifiers or initializing peripherals.
+
+**Cost.**
+
+- Without `USE_THREAD_SAFETY`: the underlying `heap_lock` / `heap_unlock` collapse to nothing; the guard is a zero-cost RAII wrapper around two no-ops.
+- With `USE_THREAD_SAFETY`: one mutex take/give per scope, same as `std::lock_guard<std::recursive_mutex>`.
+
+**Idiomatic example — read config from a shared json safely:**
+
+```cpp
+char name[64];
+char modifier[64];
+{
+    mcustl::heap_guard g;
+    const auto& entry = cfg.root().at("streams")[i];
+    /* copy into stack buffers while no foreign thread can defrag */
+    auto n = entry.at("name").get_string();
+    memcpy(name, n.c_str(), n.size());
+    name[n.size()] = 0;
+
+    auto m = entry.at("modifiers")[0].get_string();
+    memcpy(modifier, m.c_str(), m.size());
+    modifier[m.size()] = 0;
+}   /* unlocked — name / modifier are safe stack copies */
+
+stream->addModifierPreset(modifier);    /* may alloc; we don't care anymore */
 ```
 
 ---

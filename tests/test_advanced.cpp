@@ -759,6 +759,45 @@ TEST_F(McustlTestFixture, Stress_VectorOfListsOfStrings) {
     EXPECT_STREQ(vec[1].front().c_str(), "2_0");
 }
 
+/* mcustl::heap_guard smoke tests — verify lock/unlock and reentrancy. */
+
+TEST_F(McustlTestFixture, HeapGuardBasicLockUnlock) {
+    {
+        mcustl::heap_guard g;
+        mcustl::vector<int> v;
+        v.push_back(1);
+        v.push_back(2);
+        EXPECT_EQ(v.size(), 2u);
+    }
+    mcustl::vector<int> v2;
+    v2.push_back(3);
+    EXPECT_EQ(v2.size(), 1u);
+}
+
+TEST_F(McustlTestFixture, HeapGuardReentrant) {
+    /* Nested guards in the same thread must not deadlock — the mutex is
+     * recursive. If it ever weren't, this test would hang and gtest
+     * would surface it as a timeout. */
+    mcustl::heap_guard outer;
+    {
+        mcustl::heap_guard inner;
+        mcustl::vector<int> v;
+        v.push_back(42);
+        EXPECT_EQ(v[0], 42);
+    }
+    mcustl::vector<int> v2;
+    v2.push_back(7);
+    EXPECT_EQ(v2[0], 7);
+}
+
+TEST_F(McustlTestFixture, HeapGuardByPointer) {
+    /* Same heap as default in single-heap mode, reached via heap_t* ctor. */
+    mcustl::heap_guard g(mcustl_get_default_heap());
+    mcustl::vector<int> v;
+    v.push_back(99);
+    EXPECT_EQ(v[0], 99);
+}
+
 TEST_F(McustlTestFixture, Stress_AllContainersRepeatedCreateDestroy) {
     for (int round = 0; round < 5; round++) {
         {
