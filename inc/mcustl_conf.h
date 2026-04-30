@@ -68,7 +68,7 @@ extern "C" {
 /* ==================== Library Version ==================== */
 
 #ifndef MCUSTL_VERSION
-#define MCUSTL_VERSION                      "1.1.0"
+#define MCUSTL_VERSION                      "1.2.0"
 #endif
 
 /* ==================== Module Enable/Disable ==================== */
