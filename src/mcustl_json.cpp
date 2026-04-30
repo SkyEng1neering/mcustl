@@ -135,99 +135,91 @@ void json::destroy_payload() {
     /*
      * Why this looks the way it does:
      *
-     * When `this` itself lives inside a heap-allocated, tracked container
-     * (for example a `vector<json>` slot or a `map<string, json>` node),
-     * any allocator-touching call inside the destructor (e.g.
-     * `s_->~string_t()` which dfrees the string's char buffer) can trigger
-     * defragmentation. Defrag relocates blocks and updates *registered*
-     * pointers in place — but the C++ `this` pointer captured at method
-     * entry is just an stack-local register copy and does not get updated.
-     * After defrag, `this` may be stale, so any subsequent `&this->s_`
-     * computation produces the wrong tracker key and the dfree silently
-     * fails ("Try to free unexisting pointer"), leaking the payload struct
-     * and leaving a dangling tracker entry that later corrupts memory.
+     * When `*this` lives inside a heap-allocated, tracked container (a
+     * `vector<json>` slot or a `map<string, json>` node), any allocator-
+     * touching call inside the destructor (e.g. `s_->~string_t()` which
+     * dfrees the string's char buffer) can trigger defragmentation, which
+     * may relocate `*this`. Two protections are needed:
      *
-     * The fix is to *transplant* the tracker entry from `&this->s_/a_/o_`
-     * onto a stack-local pointer (via replace_pointers) BEFORE doing the
-     * inner destructor call. The stack-local survives any further defrag,
-     * so the matching dfree always succeeds.
+     *   1. The s_/a_/o_ tracker is transplanted onto a stack-local pointer
+     *      via replace_pointers BEFORE running the inner destructor. The
+     *      stack-local is value-shifted across any subsequent defrag, so
+     *      the matching dfree always finds its tracker.
+     *
+     *   2. `this` itself goes stale across defrag. We register a
+     *      pseudo-tracker for `self` so the json's heap address tracks the
+     *      relocation, and we route every `*this` access via `self->...`.
      */
-    /* Each owning case follows: transplant the s_/a_/o_ tracker to a
-     * stack-local via replace_pointers, then run the inner destructor
-     * + dfree on the local. If the tracker was already dropped by a
-     * prior defrag's orphan-removal (i.e. the containing struct holding
-     * &this->X was freed and its inner trackers were swept), the local
-     * stays nullptr; skip cleanup — that payload was already accounted
-     * for when the parent block was freed. */
-    switch (type_) {
+    MCUSTL_TRACKED_THIS(json, this->effective_heap());
+    switch (self->type_) {
         case value_t::string:
-            if (s_) {
+            if (self->s_) {
                 string_t* local_s = nullptr;
 #ifdef USE_SINGLE_HEAP_MEMORY
-                def_replace_pointers(reinterpret_cast<void**>(&s_),
+                def_replace_pointers(reinterpret_cast<void**>(&self->s_),
                                      reinterpret_cast<void**>(&local_s));
 #else
-                if (heap_) replace_pointers(heap_,
-                                            reinterpret_cast<void**>(&s_),
-                                            reinterpret_cast<void**>(&local_s));
-                else       def_replace_pointers(reinterpret_cast<void**>(&s_),
-                                                reinterpret_cast<void**>(&local_s));
+                if (self->heap_) replace_pointers(self->heap_,
+                                                  reinterpret_cast<void**>(&self->s_),
+                                                  reinterpret_cast<void**>(&local_s));
+                else             def_replace_pointers(reinterpret_cast<void**>(&self->s_),
+                                                      reinterpret_cast<void**>(&local_s));
 #endif
                 if (local_s) {
                     local_s->~string_t();
 #ifdef USE_SINGLE_HEAP_MEMORY
                     def_dfree(reinterpret_cast<void**>(&local_s));
 #else
-                    if (heap_) dfree(heap_, reinterpret_cast<void**>(&local_s), USING_PTR_ADDRESS);
-                    else       def_dfree(reinterpret_cast<void**>(&local_s));
+                    if (self->heap_) dfree(self->heap_, reinterpret_cast<void**>(&local_s), USING_PTR_ADDRESS);
+                    else             def_dfree(reinterpret_cast<void**>(&local_s));
 #endif
                 }
             }
             break;
         case value_t::array:
-            if (a_) {
+            if (self->a_) {
                 array_t* local_a = nullptr;
 #ifdef USE_SINGLE_HEAP_MEMORY
-                def_replace_pointers(reinterpret_cast<void**>(&a_),
+                def_replace_pointers(reinterpret_cast<void**>(&self->a_),
                                      reinterpret_cast<void**>(&local_a));
 #else
-                if (heap_) replace_pointers(heap_,
-                                            reinterpret_cast<void**>(&a_),
-                                            reinterpret_cast<void**>(&local_a));
-                else       def_replace_pointers(reinterpret_cast<void**>(&a_),
-                                                reinterpret_cast<void**>(&local_a));
+                if (self->heap_) replace_pointers(self->heap_,
+                                                  reinterpret_cast<void**>(&self->a_),
+                                                  reinterpret_cast<void**>(&local_a));
+                else             def_replace_pointers(reinterpret_cast<void**>(&self->a_),
+                                                      reinterpret_cast<void**>(&local_a));
 #endif
                 if (local_a) {
                     local_a->~array_t();
 #ifdef USE_SINGLE_HEAP_MEMORY
                     def_dfree(reinterpret_cast<void**>(&local_a));
 #else
-                    if (heap_) dfree(heap_, reinterpret_cast<void**>(&local_a), USING_PTR_ADDRESS);
-                    else       def_dfree(reinterpret_cast<void**>(&local_a));
+                    if (self->heap_) dfree(self->heap_, reinterpret_cast<void**>(&local_a), USING_PTR_ADDRESS);
+                    else             def_dfree(reinterpret_cast<void**>(&local_a));
 #endif
                 }
             }
             break;
         case value_t::object:
-            if (o_) {
+            if (self->o_) {
                 object_t* local_o = nullptr;
 #ifdef USE_SINGLE_HEAP_MEMORY
-                def_replace_pointers(reinterpret_cast<void**>(&o_),
+                def_replace_pointers(reinterpret_cast<void**>(&self->o_),
                                      reinterpret_cast<void**>(&local_o));
 #else
-                if (heap_) replace_pointers(heap_,
-                                            reinterpret_cast<void**>(&o_),
-                                            reinterpret_cast<void**>(&local_o));
-                else       def_replace_pointers(reinterpret_cast<void**>(&o_),
-                                                reinterpret_cast<void**>(&local_o));
+                if (self->heap_) replace_pointers(self->heap_,
+                                                  reinterpret_cast<void**>(&self->o_),
+                                                  reinterpret_cast<void**>(&local_o));
+                else             def_replace_pointers(reinterpret_cast<void**>(&self->o_),
+                                                      reinterpret_cast<void**>(&local_o));
 #endif
                 if (local_o) {
                     local_o->~object_t();
 #ifdef USE_SINGLE_HEAP_MEMORY
                     def_dfree(reinterpret_cast<void**>(&local_o));
 #else
-                    if (heap_) dfree(heap_, reinterpret_cast<void**>(&local_o), USING_PTR_ADDRESS);
-                    else       def_dfree(reinterpret_cast<void**>(&local_o));
+                    if (self->heap_) dfree(self->heap_, reinterpret_cast<void**>(&local_o), USING_PTR_ADDRESS);
+                    else             def_dfree(reinterpret_cast<void**>(&local_o));
 #endif
                 }
             }
@@ -235,7 +227,7 @@ void json::destroy_payload() {
         default:
             break;
     }
-    type_ = value_t::null;
+    self->type_ = value_t::null;
 }
 
 /*--------------------------------------------------------------------
@@ -387,21 +379,27 @@ json::json(json&& other) noexcept
 
 json& json::operator=(const json& other) {
     if (this == &other) return *this;
-    destroy_payload();
+    /* destroy_payload + deep_copy_from each may dfree+defrag and relocate
+     * `*this`. Route through self so the second operation sees a valid
+     * pointer to our struct. */
+    MCUSTL_TRACKED_THIS(json, this->effective_heap());
+    self->destroy_payload();
     /* Keep our own heap (don't migrate to other.heap_); deep-copy from other
      * into our heap. */
-    deep_copy_from(other);
+    self->deep_copy_from(other);
     return *this;
 }
 
 json& json::operator=(json&& other) noexcept {
     if (this == &other) return *this;
-    destroy_payload();
-    if (heap_ == other.heap_) {
-        take_from(other);
+    /* destroy_payload + take_from/deep_copy_from each may dfree+defrag. */
+    MCUSTL_TRACKED_THIS(json, this->effective_heap());
+    self->destroy_payload();
+    if (self->heap_ == other.heap_) {
+        self->take_from(other);
     } else {
         /* Different heap: must deep-copy then drop source. */
-        deep_copy_from(other);
+        self->deep_copy_from(other);
         other.destroy_payload();
         other.type_ = value_t::null;
     }
@@ -413,46 +411,56 @@ json::~json() {
 }
 
 void json::deep_copy_from(const json& src) {
+    /* alloc_*() doesn't defrag, but inner s_->append / a_->push_back /
+     * o_->insert all may dfree+defrag and relocate `*this`. Route every
+     * `*this` access through self. */
+    MCUSTL_TRACKED_THIS(json, this->effective_heap());
     switch (src.type_) {
-        case value_t::null:                                            break;
-        case value_t::boolean:      type_ = src.type_; b_ = src.b_;   break;
-        case value_t::number_int:   type_ = src.type_; i_ = src.i_;   break;
-        case value_t::number_float: type_ = src.type_; f_ = src.f_;   break;
+        case value_t::null:                                                  break;
+        case value_t::boolean:      self->type_ = src.type_; self->b_ = src.b_; break;
+        case value_t::number_int:   self->type_ = src.type_; self->i_ = src.i_; break;
+        case value_t::number_float: self->type_ = src.type_; self->f_ = src.f_; break;
 
         case value_t::string: {
-            s_ = alloc_string();
-            if (s_) {
-                if (src.s_) s_->append(*src.s_);
-                type_ = src.type_;
+            self->s_ = self->alloc_string();
+            if (self->s_) {
+                /* Set type_ BEFORE the append. After append `this` may be
+                 * stale, and tracked_self still updates self correctly, but
+                 * placing the field write earlier avoids any risk for the
+                 * one branch where no further `self->...` ops are needed. */
+                self->type_ = src.type_;
+                if (src.s_) self->s_->append(*src.s_);
             }
             break;
         }
         case value_t::array: {
-            a_ = alloc_array();
-            if (a_) {
-                type_ = src.type_;
+            self->a_ = self->alloc_array();
+            if (self->a_) {
+                self->type_ = src.type_;
                 if (src.a_) {
-                    array_t& sa = *src.a_;
-                    for (uint32_t i = 0; i < sa.size(); ++i) {
-                        json child = const_cast<json&>(sa.at(i)).clone(heap_);
-                        a_->push_back(child);
+                    /* Re-fetch through src.a_ (tracked) every step;
+                     * a cached `array_t&` would go stale across defrag. */
+                    for (uint32_t i = 0; i < src.a_->size(); ++i) {
+                        json child = const_cast<json&>(src.a_->at(i)).clone(self->heap_);
+                        self->a_->push_back(child);
                     }
                 }
             }
             break;
         }
         case value_t::object: {
-            o_ = alloc_object();
-            if (o_) {
-                type_ = src.type_;
+            self->o_ = self->alloc_object();
+            if (self->o_) {
+                self->type_ = src.type_;
                 if (src.o_) {
-                    object_t& so = *src.o_;
-                    auto it = so.begin();
-                    auto e = so.end();
-                    while (it != e) {
-                        json child = it->second.clone(heap_);
-                        o_->insert(it->first, child);
-                        ++it;
+                    /* Re-fetch through src.o_ (tracked) every step. */
+                    uint32_t cur = (src.o_->size() > 0)
+                        ? src.o_->begin_idx()
+                        : object_t::NPOS;
+                    while (cur != object_t::NPOS) {
+                        json child = src.o_->kv_at(cur).second.clone(self->heap_);
+                        self->o_->insert(src.o_->kv_at(cur).first, child);
+                        cur = src.o_->successor_idx(cur);
                     }
                 }
             }

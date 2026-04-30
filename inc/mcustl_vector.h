@@ -161,31 +161,34 @@ bool vector<T>::reserve(uint32_t new_capacity){
     if(capacity_val >= new_capacity){
        return true;
     }
-    heap_lock(this->alloc_mem_ptr);
-    if(reserve_new_memory(new_capacity, &container_ptr_res) != false){
+    /* tracked_this guards against `*this` relocation during the inner
+     * dfree+defrag below: read/write only via `self->...` from here. */
+    MCUSTL_TRACKED_THIS(vector<T>, this->alloc_mem_ptr);
+    heap_lock(self->alloc_mem_ptr);
+    if(self->reserve_new_memory(new_capacity, &self->container_ptr_res) != false){
         for(uint32_t i = 0; i < new_capacity; i++){
-            new ((T*)((size_t)container_ptr_res + i*sizeof(T))) T;
+            new ((T*)((size_t)self->container_ptr_res + i*sizeof(T))) T;
         }
-        for(uint32_t i = 0; i < capacity_val; i++){
-            T* obj_new_ptr = (T*)((size_t)container_ptr_res + i*sizeof(T));
-            T* obj_old_ptr = (T*)((size_t)container_ptr + i*sizeof(T));
+        for(uint32_t i = 0; i < self->capacity_val; i++){
+            T* obj_new_ptr = (T*)((size_t)self->container_ptr_res + i*sizeof(T));
+            T* obj_old_ptr = (T*)((size_t)self->container_ptr + i*sizeof(T));
             *obj_new_ptr = static_cast<T&&>(*obj_old_ptr);
         }
 
-        for(uint32_t i = 0; i < capacity_val; i++){
-            T* obj_ptr = (T*)((size_t)container_ptr + i*sizeof(T));
+        for(uint32_t i = 0; i < self->capacity_val; i++){
+            T* obj_ptr = (T*)((size_t)self->container_ptr + i*sizeof(T));
             obj_ptr->~T();
         }
 
-        if(validate_ptr(this->alloc_mem_ptr, reinterpret_cast<void**>(&container_ptr), USING_PTR_ADDRESS, NULL) != false){
-            dfree(this->alloc_mem_ptr, reinterpret_cast<void**>(&container_ptr), USING_PTR_ADDRESS);
+        if(validate_ptr(self->alloc_mem_ptr, reinterpret_cast<void**>(&self->container_ptr), USING_PTR_ADDRESS, NULL) != false){
+            dfree(self->alloc_mem_ptr, reinterpret_cast<void**>(&self->container_ptr), USING_PTR_ADDRESS);
         }
-        replace_pointers(this->alloc_mem_ptr, reinterpret_cast<void**>(&container_ptr_res), reinterpret_cast<void**>(&container_ptr));
-        capacity_val = new_capacity;
-        heap_unlock(this->alloc_mem_ptr);
+        replace_pointers(self->alloc_mem_ptr, reinterpret_cast<void**>(&self->container_ptr_res), reinterpret_cast<void**>(&self->container_ptr));
+        self->capacity_val = new_capacity;
+        heap_unlock(self->alloc_mem_ptr);
         return true;
     }
-    heap_unlock(this->alloc_mem_ptr);
+    heap_unlock(self->alloc_mem_ptr);
     return false;
 }
 
@@ -213,29 +216,31 @@ bool vector<T>::resize(uint32_t new_vect_size){
     if(new_vect_size == size_val){
         return true;
     }
-    if(new_vect_size < size_val){
-        heap_lock(this->alloc_mem_ptr);
-        for(uint32_t i = new_vect_size; i < size_val; i++){
+    /* reserve() may dfree+defrag and relocate `*this`; route through self. */
+    MCUSTL_TRACKED_THIS(vector<T>, this->alloc_mem_ptr);
+    if(new_vect_size < self->size_val){
+        heap_lock(self->alloc_mem_ptr);
+        for(uint32_t i = new_vect_size; i < self->size_val; i++){
             {
-                T* obj_ptr = (T*)((size_t)container_ptr + i*sizeof(T));
+                T* obj_ptr = (T*)((size_t)self->container_ptr + i*sizeof(T));
                 obj_ptr->~T();
             }
-            new ((T*)((size_t)container_ptr + i*sizeof(T))) T;
+            new ((T*)((size_t)self->container_ptr + i*sizeof(T))) T;
         }
-        size_val = new_vect_size;
-        heap_unlock(this->alloc_mem_ptr);
+        self->size_val = new_vect_size;
+        heap_unlock(self->alloc_mem_ptr);
         return true;
     }
 
-    if(new_vect_size > size_val){
-        if(capacity_val >= new_vect_size){
-            size_val = new_vect_size;
+    if(new_vect_size > self->size_val){
+        if(self->capacity_val >= new_vect_size){
+            self->size_val = new_vect_size;
             return true;
         }
 
         uint32_t elements_num = static_cast<uint32_t>(((static_cast<float>(new_vect_size)) * MCUSTL_CAPACITY_RESERVE_KOEF));
-        if(reserve(elements_num) == true){
-            size_val = new_vect_size;
+        if(self->reserve(elements_num) == true){
+            self->size_val = new_vect_size;
             return true;
         }
     }
@@ -244,39 +249,43 @@ bool vector<T>::resize(uint32_t new_vect_size){
 
 template<typename T>
 bool vector<T>::resize(uint32_t new_vect_size, T value){
-    uint32_t old_size = size_val;
-    heap_lock(this->alloc_mem_ptr);
-    if(resize(new_vect_size) != false){
+    /* resize(new_vect_size) may dfree+defrag and relocate `*this`. */
+    MCUSTL_TRACKED_THIS(vector<T>, this->alloc_mem_ptr);
+    uint32_t old_size = self->size_val;
+    heap_lock(self->alloc_mem_ptr);
+    if(self->resize(new_vect_size) != false){
     	if(new_vect_size > old_size){
     		for(uint32_t i = 0; i < new_vect_size - old_size; i++){
-				T* obj_ptr = (T*)((size_t)container_ptr + (i + old_size)*sizeof(T));
+				T* obj_ptr = (T*)((size_t)self->container_ptr + (i + old_size)*sizeof(T));
 				*obj_ptr = value;
 			}
     	}
-        heap_unlock(this->alloc_mem_ptr);
+        heap_unlock(self->alloc_mem_ptr);
         return true;
     }
-    heap_unlock(this->alloc_mem_ptr);
+    heap_unlock(self->alloc_mem_ptr);
     return false;
 }
 
 template<typename T>
 bool vector<T>::push_back(T item){
-    heap_lock(this->alloc_mem_ptr);
-    if(capacity_val > size_val){
-        T* obj_ptr = (T*)((size_t)container_ptr + size_val*sizeof(T));
+    /* resize() may dfree+defrag and relocate `*this`; route through self. */
+    MCUSTL_TRACKED_THIS(vector<T>, this->alloc_mem_ptr);
+    heap_lock(self->alloc_mem_ptr);
+    if(self->capacity_val > self->size_val){
+        T* obj_ptr = (T*)((size_t)self->container_ptr + self->size_val*sizeof(T));
         *obj_ptr = static_cast<T&&>(item);
-        size_val++;
-        heap_unlock(this->alloc_mem_ptr);
+        self->size_val++;
+        heap_unlock(self->alloc_mem_ptr);
         return true;
     }
-    if(resize(size_val + 1) != false){
-        T* obj_ptr = (T*)((size_t)container_ptr + (size_val - 1)*sizeof(T));
+    if(self->resize(self->size_val + 1) != false){
+        T* obj_ptr = (T*)((size_t)self->container_ptr + (self->size_val - 1)*sizeof(T));
         *obj_ptr = static_cast<T&&>(item);
-        heap_unlock(this->alloc_mem_ptr);
+        heap_unlock(self->alloc_mem_ptr);
         return true;
     }
-    heap_unlock(this->alloc_mem_ptr);
+    heap_unlock(self->alloc_mem_ptr);
     return false;
 }
 
@@ -338,38 +347,40 @@ bool vector<T>::shrink_to_fit(){
        return true;
     }
 
-    heap_lock(this->alloc_mem_ptr);
-    if(size_val == 0){
-        for(uint32_t i = 0; i < capacity_val; i++){
-            T* obj_ptr = (T*)((size_t)container_ptr + i*sizeof(T));
+    /* dfree below may relocate `*this`; route through self. */
+    MCUSTL_TRACKED_THIS(vector<T>, this->alloc_mem_ptr);
+    heap_lock(self->alloc_mem_ptr);
+    if(self->size_val == 0){
+        for(uint32_t i = 0; i < self->capacity_val; i++){
+            T* obj_ptr = (T*)((size_t)self->container_ptr + i*sizeof(T));
             obj_ptr->~T();
         }
-        dfree(this->alloc_mem_ptr, reinterpret_cast<void**>(&container_ptr), USING_PTR_ADDRESS);
-        capacity_val = 0;
-        heap_unlock(this->alloc_mem_ptr);
+        dfree(self->alloc_mem_ptr, reinterpret_cast<void**>(&self->container_ptr), USING_PTR_ADDRESS);
+        self->capacity_val = 0;
+        heap_unlock(self->alloc_mem_ptr);
         return true;
     }
 
-    if(reserve_new_memory(size_val, &container_ptr_res) != false){
-        for(uint32_t i = 0; i < size_val; i++){
-            new ((T*)((size_t)container_ptr_res + i*sizeof(T))) T;
+    if(self->reserve_new_memory(self->size_val, &self->container_ptr_res) != false){
+        for(uint32_t i = 0; i < self->size_val; i++){
+            new ((T*)((size_t)self->container_ptr_res + i*sizeof(T))) T;
         }
-        for(uint32_t i = 0; i < size_val; i++){
-            T* obj_ptr_res = (T*)((size_t)container_ptr_res + i*sizeof(T));
-            T* obj_ptr = (T*)((size_t)container_ptr + i*sizeof(T));
+        for(uint32_t i = 0; i < self->size_val; i++){
+            T* obj_ptr_res = (T*)((size_t)self->container_ptr_res + i*sizeof(T));
+            T* obj_ptr = (T*)((size_t)self->container_ptr + i*sizeof(T));
             *obj_ptr_res = static_cast<T&&>(*obj_ptr);
         }
-        for(uint32_t i = 0; i < capacity_val; i++){
-            T* obj_ptr = (T*)((size_t)container_ptr + i*sizeof(T));
+        for(uint32_t i = 0; i < self->capacity_val; i++){
+            T* obj_ptr = (T*)((size_t)self->container_ptr + i*sizeof(T));
             obj_ptr->~T();
         }
-        dfree(this->alloc_mem_ptr, reinterpret_cast<void**>(&container_ptr), USING_PTR_ADDRESS);
-        replace_pointers(this->alloc_mem_ptr, reinterpret_cast<void**>(&container_ptr_res), reinterpret_cast<void**>(&container_ptr));
-        capacity_val = size_val;
-        heap_unlock(this->alloc_mem_ptr);
+        dfree(self->alloc_mem_ptr, reinterpret_cast<void**>(&self->container_ptr), USING_PTR_ADDRESS);
+        replace_pointers(self->alloc_mem_ptr, reinterpret_cast<void**>(&self->container_ptr_res), reinterpret_cast<void**>(&self->container_ptr));
+        self->capacity_val = self->size_val;
+        heap_unlock(self->alloc_mem_ptr);
         return true;
     }
-    heap_unlock(this->alloc_mem_ptr);
+    heap_unlock(self->alloc_mem_ptr);
     return false;
 }
 
@@ -398,23 +409,29 @@ void vector<T>::info(){
 template<typename T>
 vector<T>& vector<T>::operator = (const vector &vect){
     if(&vect != this){
-        heap_lock(this->alloc_mem_ptr);
-        if(container_ptr != NULL){
-            for(uint32_t i = 0; i < capacity_val; i++){
-                T* obj_ptr = (T*)((size_t)container_ptr + i*sizeof(T));
+        /* dfree + push_back loop both can dfree+defrag and relocate `*this`.
+         * Register against vect.alloc_mem_ptr — *this is most likely on that
+         * heap (or about to be), and self->alloc_mem_ptr is reassigned mid-
+         * method so we can't rely on its post-reassign value here. */
+        heap_t* track_heap = vect.alloc_mem_ptr ? vect.alloc_mem_ptr : this->alloc_mem_ptr;
+        MCUSTL_TRACKED_THIS(vector<T>, track_heap);
+        heap_lock(self->alloc_mem_ptr);
+        if(self->container_ptr != NULL){
+            for(uint32_t i = 0; i < self->capacity_val; i++){
+                T* obj_ptr = (T*)((size_t)self->container_ptr + i*sizeof(T));
                 obj_ptr->~T();
             }
-            dfree(this->alloc_mem_ptr, reinterpret_cast<void**>(&container_ptr), USING_PTR_ADDRESS);
+            dfree(self->alloc_mem_ptr, reinterpret_cast<void**>(&self->container_ptr), USING_PTR_ADDRESS);
         }
-        size_val = 0;
-        capacity_val = 0;
-        container_ptr = NULL;
-        container_ptr_res = NULL;
-        this->alloc_mem_ptr = vect.alloc_mem_ptr;
+        self->size_val = 0;
+        self->capacity_val = 0;
+        self->container_ptr = NULL;
+        self->container_ptr_res = NULL;
+        self->alloc_mem_ptr = vect.alloc_mem_ptr;
         for(uint32_t i = 0; i < vect.size(); i++){
-            this->push_back(vect.data()[i]);
+            self->push_back(vect.data()[i]);
         }
-        heap_unlock(this->alloc_mem_ptr);
+        heap_unlock(self->alloc_mem_ptr);
     }
     return *this;
 }
@@ -454,11 +471,13 @@ vector<T>::vector(const vector &other){
     container_ptr = NULL;
     container_ptr_res = NULL;
     this->alloc_mem_ptr = other.alloc_mem_ptr;
-    heap_lock(this->alloc_mem_ptr);
+    /* push_back loop may dfree+defrag and relocate `*this`. */
+    MCUSTL_TRACKED_THIS(vector<T>, this->alloc_mem_ptr);
+    heap_lock(self->alloc_mem_ptr);
     for(uint32_t i = 0; i < other.size(); i++){
-        this->push_back(other.data()[i]);
+        self->push_back(other.data()[i]);
     }
-    heap_unlock(this->alloc_mem_ptr);
+    heap_unlock(self->alloc_mem_ptr);
 }
 
 template<typename T>
@@ -482,28 +501,30 @@ vector<T>::vector(vector &&other) noexcept {
 template<typename T>
 vector<T>& vector<T>::operator = (vector &&other) noexcept {
     if(this != &other){
+        /* dfree below may relocate `*this`; route subsequent writes via self. */
+        MCUSTL_TRACKED_THIS(vector<T>, this->alloc_mem_ptr ? this->alloc_mem_ptr : other.alloc_mem_ptr);
         // Free current data
-        if(container_ptr != NULL){
-            heap_lock(alloc_mem_ptr);
-            for(uint32_t i = 0; i < capacity_val; i++){
-                T* obj_ptr = (T*)((size_t)container_ptr + i*sizeof(T));
+        if(self->container_ptr != NULL){
+            heap_lock(self->alloc_mem_ptr);
+            for(uint32_t i = 0; i < self->capacity_val; i++){
+                T* obj_ptr = (T*)((size_t)self->container_ptr + i*sizeof(T));
                 obj_ptr->~T();
             }
-            dfree(alloc_mem_ptr, reinterpret_cast<void**>(&container_ptr), USING_PTR_ADDRESS);
-            heap_unlock(alloc_mem_ptr);
+            dfree(self->alloc_mem_ptr, reinterpret_cast<void**>(&self->container_ptr), USING_PTR_ADDRESS);
+            heap_unlock(self->alloc_mem_ptr);
         }
 
         // Transfer from other
-        alloc_mem_ptr = other.alloc_mem_ptr;
-        size_val = other.size_val;
-        capacity_val = other.capacity_val;
-        container_ptr = NULL;
-        container_ptr_res = NULL;
+        self->alloc_mem_ptr = other.alloc_mem_ptr;
+        self->size_val = other.size_val;
+        self->capacity_val = other.capacity_val;
+        self->container_ptr = NULL;
+        self->container_ptr_res = NULL;
 
         if(other.container_ptr != NULL){
-            heap_lock(alloc_mem_ptr);
-            replace_pointers(alloc_mem_ptr, (void**)&other.container_ptr, (void**)&container_ptr);
-            heap_unlock(alloc_mem_ptr);
+            heap_lock(self->alloc_mem_ptr);
+            replace_pointers(self->alloc_mem_ptr, (void**)&other.container_ptr, (void**)&self->container_ptr);
+            heap_unlock(self->alloc_mem_ptr);
         }
 
         other.size_val = 0;

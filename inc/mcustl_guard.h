@@ -91,6 +91,68 @@ private:
     bool    is_default_;
 };
 
+/**
+ * @brief mcustl::tracked_this<T> — RAII pseudo-tracker for `*this`.
+ *
+ * Methods of heap-allocated containers (vector / map / list / string) face
+ * the "stale this" problem: calling dfree may trigger defragmentation, which
+ * relocates the heap block holding *this. The compiler's `this` register
+ * snapshot still points at the OLD address, so any subsequent
+ * `this->member` read or write lands in the wrong struct.
+ *
+ * tracked_this registers a stack-local pointer (`self`) as a *pseudo-tracker*
+ * with the heap. Pseudo-trackers carry no allocation; defrag's value-shift
+ * pass updates their stored pointer when the target heap address moves, so
+ * `self` stays valid across any number of inner dfrees. The method body
+ * uses `self->member` instead of `this->member` and the code remains
+ * correct across defrags.
+ *
+ * Usage pattern:
+ * @code
+ *   bool vector<T>::reserve(uint32_t cap) {
+ *       vector<T>* self = this;
+ *       mcustl::tracked_this<vector<T>> _ts(self, this->alloc_mem_ptr);
+ *       // ... use self->capacity_val, self->container_ptr, ... ...
+ *   }
+ * @endcode
+ *
+ * The convenience macro `MCUSTL_TRACKED_THIS(SelfT, heap_expr)` declares
+ * both the `self` shadow and the RAII guard.
+ */
+template <typename T>
+class tracked_this {
+public:
+    tracked_this(T*& self_slot, heap_t* heap) noexcept
+        : slot_(&self_slot), heap_(heap) {
+        if (heap_) {
+            register_pseudo_tracker(heap_, reinterpret_cast<void**>(slot_));
+        }
+    }
+
+    ~tracked_this() noexcept {
+        if (heap_) {
+            unregister_pseudo_tracker(heap_, reinterpret_cast<void**>(slot_));
+        }
+    }
+
+    tracked_this(const tracked_this&)            = delete;
+    tracked_this& operator=(const tracked_this&) = delete;
+    tracked_this(tracked_this&&)                 = delete;
+    tracked_this& operator=(tracked_this&&)      = delete;
+
+private:
+    T**     slot_;
+    heap_t* heap_;
+};
+
 } /* namespace mcustl */
+
+/* Convenience macro: declares both the `self` shadow pointer and the
+ * tracked_this guard. Place at the top of every method that may trigger
+ * defrag (anything that calls dfree directly or transitively). After this
+ * macro, use `self->member` instead of `this->member`. */
+#define MCUSTL_TRACKED_THIS(SelfT, heap_expr)                          \
+    SelfT* self = this;                                                 \
+    ::mcustl::tracked_this<SelfT> _mcustl_self_track_(self, (heap_expr))
 
 #endif /* MCUSTL_GUARD_H */

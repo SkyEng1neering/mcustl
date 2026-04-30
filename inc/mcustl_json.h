@@ -110,6 +110,12 @@ public:
     value_t type() const                { return type_; }
     heap_t* heap() const                { return heap_; }
 
+    /* Heap-detection alias used by mcustl::pair's SFINAE machinery so that
+     * `pair<K, json>` can locate a usable heap for tracked_this when only
+     * the value half is heap-aware. Returns the explicit heap_ if set,
+     * otherwise the default heap. */
+    heap_t* get_mem_pointer() const     { return effective_heap(); }
+
     bool is_null()         const { return type_ == value_t::null; }
     bool is_boolean()      const { return type_ == value_t::boolean; }
     bool is_number_int()   const { return type_ == value_t::number_int; }

@@ -463,6 +463,15 @@ public:
     const_iterator begin() const { return const_iterator(this, tree_minimum(root_)); }
     const_iterator end() const { return const_iterator(this, NPOS); }
 
+    /* Stale-this-safe traversal helpers. Iterators cache an `owner_` map*
+     * pointer that goes stale across defrag; callers that hold a tracked
+     * pointer to the map (e.g. json::o_ in the union) can use these to
+     * re-fetch through the tracked pointer on each step instead. */
+    uint32_t begin_idx() const { return tree_minimum(root_); }
+    uint32_t successor_idx(uint32_t idx) const { return tree_successor(idx); }
+    value_type& kv_at(uint32_t idx) { return node_at(idx)->kv; }
+    const value_type& kv_at(uint32_t idx) const { return node_at(idx)->kv; }
+
     /* ---- Constructors / destructor ---- */
 
 #ifdef USE_SINGLE_HEAP_MEMORY
@@ -526,190 +535,221 @@ template<typename K, typename V>
 bool map<K,V>::reserve(uint32_t new_cap) {
     if (capacity_ >= new_cap) return true;
 
-    heap_lock(alloc_mem_ptr);
+    /* dfree below may relocate `*this`; route subsequent reads/writes via
+     * self so the pseudo-tracker keeps us pointing at the live struct. */
+    using SelfT = map<K,V>;
+    MCUSTL_TRACKED_THIS(SelfT, this->alloc_mem_ptr);
 
-    if (reserve_new_memory(new_cap, &nodes_res_)) {
+    heap_lock(self->alloc_mem_ptr);
+
+    if (self->reserve_new_memory(new_cap, &self->nodes_res_)) {
         for (uint32_t i = 0; i < new_cap; i++) {
-            new (&node_at_buf(nodes_res_, i)->kv) value_type();
-            node_at_buf(nodes_res_, i)->parent = NPOS;
-            node_at_buf(nodes_res_, i)->left = NPOS;
-            node_at_buf(nodes_res_, i)->right = NPOS;
-            node_at_buf(nodes_res_, i)->red = false;
+            new (&self->node_at_buf(self->nodes_res_, i)->kv) value_type();
+            self->node_at_buf(self->nodes_res_, i)->parent = NPOS;
+            self->node_at_buf(self->nodes_res_, i)->left = NPOS;
+            self->node_at_buf(self->nodes_res_, i)->right = NPOS;
+            self->node_at_buf(self->nodes_res_, i)->red = false;
         }
 
-        for (uint32_t i = 0; i < capacity_; i++) {
-            Node* old_n = node_at(i);
-            Node* new_n = node_at_buf(nodes_res_, i);
-            new_n->kv = static_cast<value_type&&>(old_n->kv);
-            new_n->parent = old_n->parent;
-            new_n->left = old_n->left;
-            new_n->right = old_n->right;
-            new_n->red = old_n->red;
+        for (uint32_t i = 0; i < self->capacity_; i++) {
+            /* Each kv assignment may dfree+defrag and relocate `*this`. The
+             * pseudo-tracker on self keeps self valid, but Node* locals
+             * computed from self go stale after a defrag. Re-fetch through
+             * self before every field assignment so we always write into
+             * the freshly-located Node. */
+            self->node_at_buf(self->nodes_res_, i)->kv.first =
+                self->node_at(i)->kv.first;
+            self->node_at_buf(self->nodes_res_, i)->kv.second =
+                static_cast<V&&>(self->node_at(i)->kv.second);
+            self->node_at_buf(self->nodes_res_, i)->parent = self->node_at(i)->parent;
+            self->node_at_buf(self->nodes_res_, i)->left = self->node_at(i)->left;
+            self->node_at_buf(self->nodes_res_, i)->right = self->node_at(i)->right;
+            self->node_at_buf(self->nodes_res_, i)->red = self->node_at(i)->red;
         }
 
-        for (uint32_t i = 0; i < capacity_; i++) {
-            node_at(i)->kv.~value_type();
+        for (uint32_t i = 0; i < self->capacity_; i++) {
+            /* Destruct first and second separately, re-fetching the node
+             * through self between them — A's dtor may dfree+defrag and
+             * relocate `*this`, in which case B's compiler-generated
+             * destruct path would receive a stale `&kv.second`. */
+            self->node_at(i)->kv.first.~K();
+            self->node_at(i)->kv.second.~V();
         }
 
-        if (validate_ptr(alloc_mem_ptr, reinterpret_cast<void**>(&nodes_),
+        if (validate_ptr(self->alloc_mem_ptr, reinterpret_cast<void**>(&self->nodes_),
                          USING_PTR_ADDRESS, NULL) != false) {
-            dfree(alloc_mem_ptr, reinterpret_cast<void**>(&nodes_), USING_PTR_ADDRESS);
+            dfree(self->alloc_mem_ptr, reinterpret_cast<void**>(&self->nodes_), USING_PTR_ADDRESS);
         }
 
-        replace_pointers(alloc_mem_ptr,
-                         reinterpret_cast<void**>(&nodes_res_),
-                         reinterpret_cast<void**>(&nodes_));
+        replace_pointers(self->alloc_mem_ptr,
+                         reinterpret_cast<void**>(&self->nodes_res_),
+                         reinterpret_cast<void**>(&self->nodes_));
 
-        for (uint32_t i = new_cap - 1; i >= capacity_; i--) {
-            node_at(i)->parent = NPOS;
-            node_at(i)->left = NPOS;
-            node_at(i)->right = free_head_;
-            node_at(i)->red = false;
-            free_head_ = i;
+        for (uint32_t i = new_cap - 1; i >= self->capacity_; i--) {
+            self->node_at(i)->parent = NPOS;
+            self->node_at(i)->left = NPOS;
+            self->node_at(i)->right = self->free_head_;
+            self->node_at(i)->red = false;
+            self->free_head_ = i;
             if (i == 0) break;
         }
 
-        capacity_ = new_cap;
-        heap_unlock(alloc_mem_ptr);
+        self->capacity_ = new_cap;
+        heap_unlock(self->alloc_mem_ptr);
         return true;
     }
 
-    heap_unlock(alloc_mem_ptr);
+    heap_unlock(self->alloc_mem_ptr);
     return false;
 }
 
 template<typename K, typename V>
 void map<K,V>::clear() {
-    heap_lock(alloc_mem_ptr);
+    /* kv destructors may dfree (e.g. V=json), which can relocate `*this`. */
+    using SelfT = map<K,V>;
+    MCUSTL_TRACKED_THIS(SelfT, this->alloc_mem_ptr);
+    heap_lock(self->alloc_mem_ptr);
 
-    for (uint32_t i = 0; i < capacity_; i++) {
-        node_at(i)->kv.~value_type();
-        new (&node_at(i)->kv) value_type();
+    for (uint32_t i = 0; i < self->capacity_; i++) {
+        self->node_at(i)->kv.~value_type();
+        new (&self->node_at(i)->kv) value_type();
     }
 
-    root_ = NPOS;
-    size_ = 0;
-    free_head_ = NPOS;
-    for (uint32_t i = 0; i < capacity_; i++) {
-        node_at(i)->parent = NPOS;
-        node_at(i)->left = NPOS;
-        node_at(i)->right = free_head_;
-        node_at(i)->red = false;
-        free_head_ = i;
+    self->root_ = NPOS;
+    self->size_ = 0;
+    self->free_head_ = NPOS;
+    for (uint32_t i = 0; i < self->capacity_; i++) {
+        self->node_at(i)->parent = NPOS;
+        self->node_at(i)->left = NPOS;
+        self->node_at(i)->right = self->free_head_;
+        self->node_at(i)->red = false;
+        self->free_head_ = i;
     }
 
-    heap_unlock(alloc_mem_ptr);
+    heap_unlock(self->alloc_mem_ptr);
 }
 
 template<typename K, typename V>
 bool map<K,V>::insert(const K& key, const V& value) {
-    heap_lock(alloc_mem_ptr);
+    /* grow() may dfree+defrag and relocate `*this`, plus the kv assignments
+     * (which call into K::operator= / V::operator= → string push_back ...)
+     * may dfree as they grow inner buffers. Route through self. */
+    using SelfT = map<K,V>;
+    MCUSTL_TRACKED_THIS(SelfT, this->alloc_mem_ptr);
+    heap_lock(self->alloc_mem_ptr);
 
     uint32_t parent = NPOS;
-    uint32_t cur = root_;
+    uint32_t cur = self->root_;
     while (cur != NPOS) {
         parent = cur;
-        if (key < node_at(cur)->kv.first) {
-            cur = node_at(cur)->left;
-        } else if (node_at(cur)->kv.first < key) {
-            cur = node_at(cur)->right;
+        if (key < self->node_at(cur)->kv.first) {
+            cur = self->node_at(cur)->left;
+        } else if (self->node_at(cur)->kv.first < key) {
+            cur = self->node_at(cur)->right;
         } else {
-            heap_unlock(alloc_mem_ptr);
+            heap_unlock(self->alloc_mem_ptr);
             return false;
         }
     }
 
-    if (free_head_ == NPOS) {
-        if (!grow()) {
-            heap_unlock(alloc_mem_ptr);
+    if (self->free_head_ == NPOS) {
+        if (!self->grow()) {
+            heap_unlock(self->alloc_mem_ptr);
             return false;
         }
     }
 
-    uint32_t z = alloc_node();
-    node_at(z)->kv.first = key;
-    node_at(z)->kv.second = value;
-    node_at(z)->parent = parent;
-    node_at(z)->left = NPOS;
-    node_at(z)->right = NPOS;
-    node_at(z)->red = true;
+    uint32_t z = self->alloc_node();
+    self->node_at(z)->kv.first = key;
+    self->node_at(z)->kv.second = value;
+    self->node_at(z)->parent = parent;
+    self->node_at(z)->left = NPOS;
+    self->node_at(z)->right = NPOS;
+    self->node_at(z)->red = true;
 
     if (parent == NPOS) {
-        root_ = z;
-    } else if (key < node_at(parent)->kv.first) {
-        node_at(parent)->left = z;
+        self->root_ = z;
+    } else if (key < self->node_at(parent)->kv.first) {
+        self->node_at(parent)->left = z;
     } else {
-        node_at(parent)->right = z;
+        self->node_at(parent)->right = z;
     }
 
-    size_++;
-    insert_fixup(z);
+    self->size_++;
+    self->insert_fixup(z);
 
-    heap_unlock(alloc_mem_ptr);
+    heap_unlock(self->alloc_mem_ptr);
     return true;
 }
 
 template<typename K, typename V>
 bool map<K,V>::insert(const K& key, V&& value) {
-    heap_lock(alloc_mem_ptr);
+    /* See insert(const K&, const V&) — same stale-this concerns. */
+    using SelfT = map<K,V>;
+    MCUSTL_TRACKED_THIS(SelfT, this->alloc_mem_ptr);
+    heap_lock(self->alloc_mem_ptr);
 
     uint32_t parent = NPOS;
-    uint32_t cur = root_;
+    uint32_t cur = self->root_;
     while (cur != NPOS) {
         parent = cur;
-        if (key < node_at(cur)->kv.first) {
-            cur = node_at(cur)->left;
-        } else if (node_at(cur)->kv.first < key) {
-            cur = node_at(cur)->right;
+        if (key < self->node_at(cur)->kv.first) {
+            cur = self->node_at(cur)->left;
+        } else if (self->node_at(cur)->kv.first < key) {
+            cur = self->node_at(cur)->right;
         } else {
-            heap_unlock(alloc_mem_ptr);
+            heap_unlock(self->alloc_mem_ptr);
             return false;
         }
     }
 
-    if (free_head_ == NPOS) {
-        if (!grow()) {
-            heap_unlock(alloc_mem_ptr);
+    if (self->free_head_ == NPOS) {
+        if (!self->grow()) {
+            heap_unlock(self->alloc_mem_ptr);
             return false;
         }
     }
 
-    uint32_t z = alloc_node();
-    node_at(z)->kv.first = key;
-    node_at(z)->kv.second = static_cast<V&&>(value);
-    node_at(z)->parent = parent;
-    node_at(z)->left = NPOS;
-    node_at(z)->right = NPOS;
-    node_at(z)->red = true;
+    uint32_t z = self->alloc_node();
+    self->node_at(z)->kv.first = key;
+    self->node_at(z)->kv.second = static_cast<V&&>(value);
+    self->node_at(z)->parent = parent;
+    self->node_at(z)->left = NPOS;
+    self->node_at(z)->right = NPOS;
+    self->node_at(z)->red = true;
 
     if (parent == NPOS) {
-        root_ = z;
-    } else if (key < node_at(parent)->kv.first) {
-        node_at(parent)->left = z;
+        self->root_ = z;
+    } else if (key < self->node_at(parent)->kv.first) {
+        self->node_at(parent)->left = z;
     } else {
-        node_at(parent)->right = z;
+        self->node_at(parent)->right = z;
     }
 
-    size_++;
-    insert_fixup(z);
+    self->size_++;
+    self->insert_fixup(z);
 
-    heap_unlock(alloc_mem_ptr);
+    heap_unlock(self->alloc_mem_ptr);
     return true;
 }
 
 template<typename K, typename V>
 bool map<K,V>::erase(const K& key) {
-    heap_lock(alloc_mem_ptr);
+    /* erase_node→free_node destroys K and V; if either has heap-owned
+     * payload (e.g. V=json), its destructor dfrees and may relocate `*this`. */
+    using SelfT = map<K,V>;
+    MCUSTL_TRACKED_THIS(SelfT, this->alloc_mem_ptr);
+    heap_lock(self->alloc_mem_ptr);
 
-    uint32_t z = tree_find(key);
+    uint32_t z = self->tree_find(key);
     if (z == NPOS) {
-        heap_unlock(alloc_mem_ptr);
+        heap_unlock(self->alloc_mem_ptr);
         return false;
     }
 
-    erase_node(z);
+    self->erase_node(z);
 
-    heap_unlock(alloc_mem_ptr);
+    heap_unlock(self->alloc_mem_ptr);
     return true;
 }
 
@@ -717,10 +757,12 @@ template<typename K, typename V>
 typename map<K,V>::iterator map<K,V>::erase(iterator pos) {
     if (pos.idx_ == NPOS) return end();
 
-    heap_lock(alloc_mem_ptr);
-    uint32_t next = tree_successor(pos.idx_);
-    erase_node(pos.idx_);
-    heap_unlock(alloc_mem_ptr);
+    using SelfT = map<K,V>;
+    MCUSTL_TRACKED_THIS(SelfT, this->alloc_mem_ptr);
+    heap_lock(self->alloc_mem_ptr);
+    uint32_t next = self->tree_successor(pos.idx_);
+    self->erase_node(pos.idx_);
+    heap_unlock(self->alloc_mem_ptr);
 
     return iterator(this, next);
 }
@@ -840,60 +882,69 @@ map<K,V>::map(const map& other) {
     free_head_ = NPOS;
     alloc_mem_ptr = other.alloc_mem_ptr;
 
-    heap_lock(alloc_mem_ptr);
-    if (other.size_ > 0 && reserve(other.capacity_)) {
+    /* reserve() and the kv assignments may dfree+defrag and relocate `*this`. */
+    using SelfT = map<K,V>;
+    MCUSTL_TRACKED_THIS(SelfT, this->alloc_mem_ptr);
+    heap_lock(self->alloc_mem_ptr);
+    if (other.size_ > 0 && self->reserve(other.capacity_)) {
         for (uint32_t i = 0; i < other.capacity_; i++) {
             Node* src = other.node_at(i);
-            Node* dst = node_at(i);
+            Node* dst = self->node_at(i);
             dst->kv = src->kv;
             dst->parent = src->parent;
             dst->left = src->left;
             dst->right = src->right;
             dst->red = src->red;
         }
-        root_ = other.root_;
-        size_ = other.size_;
-        free_head_ = other.free_head_;
+        self->root_ = other.root_;
+        self->size_ = other.size_;
+        self->free_head_ = other.free_head_;
     }
-    heap_unlock(alloc_mem_ptr);
+    heap_unlock(self->alloc_mem_ptr);
 }
 
 template<typename K, typename V>
 map<K,V>& map<K,V>::operator=(const map& other) {
     if (this != &other) {
-        heap_lock(alloc_mem_ptr);
+        using SelfT = map<K,V>;
+        /* dfree + reserve + kv copy can all dfree+defrag and relocate `*this`.
+         * Pin against vect's heap (the heap *this is about to live on). */
+        heap_t* track_heap = other.alloc_mem_ptr ? other.alloc_mem_ptr : this->alloc_mem_ptr;
+        MCUSTL_TRACKED_THIS(SelfT, track_heap);
 
-        if (nodes_ != NULL) {
-            for (uint32_t i = 0; i < capacity_; i++) {
-                node_at(i)->kv.~value_type();
+        heap_lock(self->alloc_mem_ptr);
+
+        if (self->nodes_ != NULL) {
+            for (uint32_t i = 0; i < self->capacity_; i++) {
+                self->node_at(i)->kv.~value_type();
             }
-            dfree(alloc_mem_ptr, reinterpret_cast<void**>(&nodes_), USING_PTR_ADDRESS);
+            dfree(self->alloc_mem_ptr, reinterpret_cast<void**>(&self->nodes_), USING_PTR_ADDRESS);
         }
 
-        nodes_ = NULL;
-        nodes_res_ = NULL;
-        size_ = 0;
-        capacity_ = 0;
-        root_ = NPOS;
-        free_head_ = NPOS;
-        alloc_mem_ptr = other.alloc_mem_ptr;
+        self->nodes_ = NULL;
+        self->nodes_res_ = NULL;
+        self->size_ = 0;
+        self->capacity_ = 0;
+        self->root_ = NPOS;
+        self->free_head_ = NPOS;
+        self->alloc_mem_ptr = other.alloc_mem_ptr;
 
-        if (other.size_ > 0 && reserve(other.capacity_)) {
+        if (other.size_ > 0 && self->reserve(other.capacity_)) {
             for (uint32_t i = 0; i < other.capacity_; i++) {
                 Node* src = other.node_at(i);
-                Node* dst = node_at(i);
+                Node* dst = self->node_at(i);
                 dst->kv = src->kv;
                 dst->parent = src->parent;
                 dst->left = src->left;
                 dst->right = src->right;
                 dst->red = src->red;
             }
-            root_ = other.root_;
-            size_ = other.size_;
-            free_head_ = other.free_head_;
+            self->root_ = other.root_;
+            self->size_ = other.size_;
+            self->free_head_ = other.free_head_;
         }
 
-        heap_unlock(alloc_mem_ptr);
+        heap_unlock(self->alloc_mem_ptr);
     }
     return *this;
 }
@@ -923,27 +974,31 @@ map<K,V>::map(map&& other) noexcept {
 template<typename K, typename V>
 map<K,V>& map<K,V>::operator=(map&& other) noexcept {
     if (this != &other) {
-        if (nodes_ != NULL) {
-            heap_lock(alloc_mem_ptr);
-            for (uint32_t i = 0; i < capacity_; i++) {
-                node_at(i)->kv.~value_type();
+        using SelfT = map<K,V>;
+        heap_t* track_heap = this->alloc_mem_ptr ? this->alloc_mem_ptr : other.alloc_mem_ptr;
+        MCUSTL_TRACKED_THIS(SelfT, track_heap);
+
+        if (self->nodes_ != NULL) {
+            heap_lock(self->alloc_mem_ptr);
+            for (uint32_t i = 0; i < self->capacity_; i++) {
+                self->node_at(i)->kv.~value_type();
             }
-            dfree(alloc_mem_ptr, reinterpret_cast<void**>(&nodes_), USING_PTR_ADDRESS);
-            heap_unlock(alloc_mem_ptr);
+            dfree(self->alloc_mem_ptr, reinterpret_cast<void**>(&self->nodes_), USING_PTR_ADDRESS);
+            heap_unlock(self->alloc_mem_ptr);
         }
 
-        alloc_mem_ptr = other.alloc_mem_ptr;
-        size_ = other.size_;
-        capacity_ = other.capacity_;
-        root_ = other.root_;
-        free_head_ = other.free_head_;
-        nodes_ = NULL;
-        nodes_res_ = NULL;
+        self->alloc_mem_ptr = other.alloc_mem_ptr;
+        self->size_ = other.size_;
+        self->capacity_ = other.capacity_;
+        self->root_ = other.root_;
+        self->free_head_ = other.free_head_;
+        self->nodes_ = NULL;
+        self->nodes_res_ = NULL;
 
         if (other.nodes_ != NULL) {
-            heap_lock(alloc_mem_ptr);
-            replace_pointers(alloc_mem_ptr, (void**)&other.nodes_, (void**)&nodes_);
-            heap_unlock(alloc_mem_ptr);
+            heap_lock(self->alloc_mem_ptr);
+            replace_pointers(self->alloc_mem_ptr, (void**)&other.nodes_, (void**)&self->nodes_);
+            heap_unlock(self->alloc_mem_ptr);
         }
 
         other.size_ = 0;

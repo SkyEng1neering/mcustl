@@ -63,6 +63,10 @@
 /* Always include allocator (foundation for everything) */
 #include "mcustl_alloc.h"
 
+/* RAII heap mutex guard + tracked_this helper — needed by every container
+ * implementation, so it must be visible before they're included. */
+#include "mcustl_guard.h"
+
 /* Pair is always available (no allocator dependency) */
 #include "mcustl_pair.h"
 
@@ -90,8 +94,5 @@
 #if MCUSTL_USE_JSON
 #include "mcustl_json.h"
 #endif
-
-/* RAII heap mutex guard — always available, no module dependency */
-#include "mcustl_guard.h"
 
 #endif /* MCUSTL_H */

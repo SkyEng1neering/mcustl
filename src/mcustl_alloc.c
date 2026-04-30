@@ -258,6 +258,13 @@ static bool validate_ptr_internal(heap_t* heap_struct_ptr, void **ptr, validate_
 		return false;
 	}
 	for(uint32_t i = 0; i < heap_struct_ptr->alloc_info.allocations_num; i++){
+		/* Skip pseudo-trackers (registered via register_pseudo_tracker
+		 * for stale-this protection). They have allocated_size==0 and
+		 * must never be returned as a dfree/replace_pointers target. */
+		if(heap_struct_ptr->alloc_info.ptr_info_arr[i].allocated_size == 0 &&
+		   heap_struct_ptr->alloc_info.ptr_info_arr[i].free_flag == false){
+			continue;
+		}
 		if(condition == USING_PTR_ADDRESS){
 			if(heap_struct_ptr->alloc_info.ptr_info_arr[i].ptr == (uint8_t**)ptr){
 				if(ptr_index != NULL){
@@ -385,10 +392,20 @@ static void defrag_memory(heap_t* heap_struct_ptr){
                 bytes_to_move);
 
         /* Step 4: shift VALUES of remaining trackers that pointed past
-         * the freed block. */
+         * the freed block. Only shift values that lie inside the heap —
+         * a tracker whose value is on the stack (e.g. pseudo-tracker for
+         * a stack-allocated `*this`) or in another heap must NOT be
+         * shifted because the freed block's memmove only moves heap
+         * bytes. (Without this guard, pseudo-trackers for stack `*this`
+         * get their value smashed and the next dereference goes wild,
+         * since stack addresses on most platforms are above the heap.) */
+        size_t heap_lo = (size_t)heap_struct_ptr->mem;
+        size_t heap_hi = heap_lo + heap_struct_ptr->total_size;
         for(uint32_t k3 = 0; k3 < heap_struct_ptr->alloc_info.allocations_num; k3++){
             if(k3 == i) continue;
-            if(*(heap_struct_ptr->alloc_info.ptr_info_arr[k3].ptr) > start_mem_ptr){
+            uint8_t *val = *(heap_struct_ptr->alloc_info.ptr_info_arr[k3].ptr);
+            size_t v = (size_t)val;
+            if(val > start_mem_ptr && v >= heap_lo && v < heap_hi){
                 *(heap_struct_ptr->alloc_info.ptr_info_arr[k3].ptr) -= alloc_size;
             }
         }
@@ -474,6 +491,58 @@ void replace_pointers(heap_t* heap_struct_ptr, void **ptr_to_replace, void **ptr
 
 	replace_pointers_internal(heap_struct_ptr, ptr_to_replace, ptr_new);
 
+#ifdef USE_THREAD_SAFETY
+	MCUSTL_MUTEX_UNLOCK(heap_struct_ptr->mutex);
+#endif
+}
+
+void register_pseudo_tracker(heap_t *heap_struct_ptr, void **self_addr){
+	if(!heap_struct_ptr || !self_addr){
+		return;
+	}
+#ifdef USE_THREAD_SAFETY
+	MCUSTL_MUTEX_LOCK(heap_struct_ptr->mutex);
+#endif
+	if(heap_struct_ptr->alloc_info.allocations_num < MAX_NUM_OF_ALLOCATIONS){
+		uint32_t i = heap_struct_ptr->alloc_info.allocations_num;
+		heap_struct_ptr->alloc_info.ptr_info_arr[i].ptr = (uint8_t**)self_addr;
+		heap_struct_ptr->alloc_info.ptr_info_arr[i].allocated_size = 0;
+		heap_struct_ptr->alloc_info.ptr_info_arr[i].free_flag = false;
+		heap_struct_ptr->alloc_info.allocations_num++;
+		if(heap_struct_ptr->alloc_info.allocations_num >
+		   heap_struct_ptr->alloc_info.max_allocations_amount){
+			heap_struct_ptr->alloc_info.max_allocations_amount =
+				heap_struct_ptr->alloc_info.allocations_num;
+		}
+	}
+	else {
+		mcustl_debug("register_pseudo_tracker: tracker array full\n");
+	}
+#ifdef USE_THREAD_SAFETY
+	MCUSTL_MUTEX_UNLOCK(heap_struct_ptr->mutex);
+#endif
+}
+
+void unregister_pseudo_tracker(heap_t *heap_struct_ptr, void **self_addr){
+	if(!heap_struct_ptr || !self_addr){
+		return;
+	}
+#ifdef USE_THREAD_SAFETY
+	MCUSTL_MUTEX_LOCK(heap_struct_ptr->mutex);
+#endif
+	for(uint32_t i = heap_struct_ptr->alloc_info.allocations_num; i > 0; --i){
+		uint32_t idx = i - 1;
+		if(heap_struct_ptr->alloc_info.ptr_info_arr[idx].ptr == (uint8_t**)self_addr &&
+		   heap_struct_ptr->alloc_info.ptr_info_arr[idx].allocated_size == 0 &&
+		   heap_struct_ptr->alloc_info.ptr_info_arr[idx].free_flag == false){
+			for(uint32_t k = idx; k < heap_struct_ptr->alloc_info.allocations_num - 1; ++k){
+				heap_struct_ptr->alloc_info.ptr_info_arr[k] =
+					heap_struct_ptr->alloc_info.ptr_info_arr[k + 1];
+			}
+			heap_struct_ptr->alloc_info.allocations_num--;
+			break;
+		}
+	}
 #ifdef USE_THREAD_SAFETY
 	MCUSTL_MUTEX_UNLOCK(heap_struct_ptr->mutex);
 #endif

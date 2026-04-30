@@ -77,6 +77,28 @@ void replace_pointers(heap_t *heap_struct_ptr, void **ptr_to_replace, void **ptr
 void heap_lock(heap_t *heap_struct_ptr);
 void heap_unlock(heap_t *heap_struct_ptr);
 
+/* ============================================================================
+ * Pseudo-trackers (self-pointer tracking for heap-allocated `this`)
+ * ----------------------------------------------------------------------------
+ * Methods on heap-allocated containers face the "stale this" problem: once
+ * the method calls dfree, defrag may relocate the block holding *this. The
+ * compiler's `this` register copy still points at the OLD address. Reading
+ * or writing through `this->member` after that point lands in the wrong
+ * struct.
+ *
+ * A pseudo-tracker is a stack-local pointer registered in the heap's tracker
+ * array WITHOUT any backing allocation (allocated_size==0). Defrag's
+ * value-shift pass updates the stored pointer value the same way it updates
+ * any other tracked pointer — so a `T* self` registered at method entry
+ * tracks the moving `*this` automatically. Use `self->...` inside the method
+ * instead of `this->...` and the code stays correct across defrags.
+ *
+ * Pseudo-trackers must be unregistered before the stack frame goes away.
+ * Prefer the C++ `mcustl::tracked_this<T>` RAII helper from mcustl_guard.h.
+ * ========================================================================== */
+void register_pseudo_tracker(heap_t *heap_struct_ptr, void **self_addr);
+void unregister_pseudo_tracker(heap_t *heap_struct_ptr, void **self_addr);
+
 void print_dalloc_info(heap_t *heap_struct_ptr);
 int dalloc_heap_info_str(heap_t *heap_struct_ptr, char *buf, uint32_t buf_size);
 void dump_heap(heap_t *heap_struct_ptr);
