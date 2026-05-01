@@ -860,6 +860,897 @@ TEST_F(McustlTestFixture, JsonParseDeviceConfigShape_FragmentedHeap) {
     EXPECT_GT(persistent.capacity(), 0u);
 }
 
+/* ============================================================
+ * Use-after-free in mcustl::json::parser cleanup path
+ * ============================================================
+ *
+ * Originally observed as a hardfault on STM32 when ESP32 web-UI called
+ * GET_EFFECTS_REGISTRY → STM32 ran mcustl::json::parse on each preset's
+ * userParamsSchema literal. Stack:
+ *
+ *   parse_array (mcustl_json.cpp:1350)
+ *     → ~json (mcustl_json.cpp:411)
+ *       → destroy_payload (mcustl_json.cpp:217)
+ *         → ~map<string,json> (mcustl_map.h:1031)
+ *           → ~pair (mcustl_pair.h:84)
+ *             → ~string (mcustl_string.cpp:428)
+ *               → ~vector<char> (mcustl_vector.h:445)
+ *                 → heap_lock(saved_heap=GARBAGE)   ← SEGV
+ *
+ * The "saved_heap" pointer at fault time is `0x000600000005` on host
+ * (similar 0xC4BBB045-pattern on STM32 from FILL_FREED_MEMORY_BY_NULLS).
+ * Decoded as little-endian uint32 pair: `size=5, capacity=6`. Those
+ * are the size_val/capacity_val of *another* vector that landed on top
+ * of the freed buffer — a classic UAF or double-destroy fingerprint.
+ *
+ * Bisection results — see tests below:
+ *   PASS: 2+ empty objects, simple string-only objects, mixed-type
+ *         objects with 1-char string values, heterogeneous key counts,
+ *         3-string + 2-float objects.
+ *   FAIL: a single object with **2 string fields whose VALUES are
+ *         >= 4 chars long**, **plus 3 numeric (float or int) fields**,
+ *         all inside an array.
+ *
+ * The 4-char threshold exactly matches when mcustl::string's inner
+ * vector<char> has to grow past its initial capacity and triggers a
+ * real allocation+possible defrag during parse, suggesting the trigger
+ * is a defrag-induced relocation of the parse_object's `obj` while
+ * we're holding stale references to its key/value slots.
+ *
+ * Where to look in mcustl when fixing:
+ *   - parse_object's per-iteration `obj.o_->insert(key, val)` evaluates
+ *     `key`/`val` references; if a defrag fires inside the insert,
+ *     these refs go stale.
+ *   - parse_array's end-of-loop `~elt()` runs after push_back has
+ *     deep-copied. If the deep copy of an object is shallower than
+ *     intended, both elt and arr's slot share state, and one's free
+ *     corrupts the other.
+ *   - mcustl::pair::~pair() and mcustl::string::~string() lack
+ *     tracked_this protection; a defrag inside the inner ~vector::dfree
+ *     leaves the outer pair/string `this` pointer stale.
+ *
+ * The tests below pin down the trigger and serve as a regression net
+ * for the eventual mcustl fix. */
+
+TEST_F(McustlTestFixture, JsonParseAOO_TwoEmptyObjects) {
+    json j = json::parse("[{},{}]");
+    ASSERT_TRUE(j.is_array());
+    EXPECT_EQ(j.size(), 2u);
+}
+
+TEST_F(McustlTestFixture, JsonParseAOO_TwoObjectsOneIntKey) {
+    json j = json::parse("[{\"a\":1},{\"b\":2}]");
+    ASSERT_TRUE(j.is_array());
+    EXPECT_EQ(j.size(), 2u);
+    EXPECT_EQ(j[0].at("a").get_int(), 1);
+    EXPECT_EQ(j[1].at("b").get_int(), 2);
+}
+
+TEST_F(McustlTestFixture, JsonParseAOO_TwoObjectsOneStringKey) {
+    json j = json::parse("[{\"a\":\"x\"},{\"b\":\"y\"}]");
+    ASSERT_TRUE(j.is_array());
+    EXPECT_EQ(j.size(), 2u);
+    EXPECT_STREQ(j[0].at("a").get_string().c_str(), "x");
+    EXPECT_STREQ(j[1].at("b").get_string().c_str(), "y");
+}
+
+TEST_F(McustlTestFixture, JsonParseAOO_ThreeObjectsManyStringFields) {
+    /* 3 objects, each with 2 string fields. Closer to the schema shape. */
+    json j = json::parse(
+        "[{\"name\":\"a\",\"type\":\"x\"},"
+        " {\"name\":\"b\",\"type\":\"y\"},"
+        " {\"name\":\"c\",\"type\":\"z\"}]");
+    ASSERT_TRUE(j.is_array());
+    EXPECT_EQ(j.size(), 3u);
+    EXPECT_STREQ(j[2].at("name").get_string().c_str(), "c");
+}
+
+TEST_F(McustlTestFixture, JsonParseAOO_ThreeObjectsMixedTypes) {
+    /* String + int + bool fields per object; multiple objects. */
+    json j = json::parse(
+        "[{\"name\":\"a\",\"min\":1,\"on\":true},"
+        " {\"name\":\"b\",\"min\":2,\"on\":false},"
+        " {\"name\":\"c\",\"min\":3,\"on\":true}]");
+    ASSERT_TRUE(j.is_array());
+    EXPECT_EQ(j.size(), 3u);
+    EXPECT_EQ(j[1].at("min").get_int(), 2);
+    EXPECT_FALSE(j[1].at("on").get_bool());
+}
+
+TEST_F(McustlTestFixture, JsonParseAOO_NegativeFloatField) {
+    /* The freq_shifter schema has min:-500.0. Test that parsing negative
+     * floats inside array-of-objects doesn't trigger the bug. */
+    json j = json::parse("[{\"min\":-500.0,\"max\":500.0}]");
+    ASSERT_TRUE(j.is_array());
+    EXPECT_DOUBLE_EQ(j[0].at("min").get_float(), -500.0);
+    EXPECT_DOUBLE_EQ(j[0].at("max").get_float(), 500.0);
+}
+
+/* Two-strings + three-floats — does string LENGTH matter? */
+TEST_F(McustlTestFixture, JsonParseAOO_FS_LongStrings) {
+    json j = json::parse(
+        "[{\"name\":\"shift_hz\",\"type\":\"float\",\"min\":1.0,\"max\":2.0,\"default\":3.0}]");
+    ASSERT_TRUE(j.is_array());
+}
+
+TEST_F(McustlTestFixture, JsonParseAOO_FS_NegativeFloat) {
+    /* Same as FS_2str3float (which passed), but with negative number. */
+    json j = json::parse(
+        "[{\"name\":\"a\",\"type\":\"b\",\"min\":-500.0,\"max\":2.0,\"default\":3.0}]");
+    ASSERT_TRUE(j.is_array());
+}
+
+/* Two-strings + three-floats bisection */
+
+/* 1 string + 3 floats. */
+TEST_F(McustlTestFixture, JsonParseAOO_FS_1str3float) {
+    json j = json::parse(
+        "[{\"name\":\"shift_hz\",\"min\":-500.0,\"max\":500.0,\"default\":5.0}]");
+    ASSERT_TRUE(j.is_array());
+}
+
+/* 2 strings + 3 floats — same as FS1_NoDescription, repeat for clarity. */
+TEST_F(McustlTestFixture, JsonParseAOO_FS_2str3float) {
+    json j = json::parse(
+        "[{\"name\":\"a\",\"type\":\"b\",\"min\":1.0,\"max\":2.0,\"default\":3.0}]");
+    ASSERT_TRUE(j.is_array());
+}
+
+/* 2 strings + 3 ints (instead of floats). */
+TEST_F(McustlTestFixture, JsonParseAOO_FS_2str3int) {
+    json j = json::parse(
+        "[{\"name\":\"a\",\"type\":\"b\",\"min\":1,\"max\":2,\"default\":3}]");
+    ASSERT_TRUE(j.is_array());
+}
+
+/* 3 strings + 2 floats. */
+TEST_F(McustlTestFixture, JsonParseAOO_FS_3str2float) {
+    json j = json::parse(
+        "[{\"a\":\"x\",\"b\":\"y\",\"c\":\"z\",\"min\":1.0,\"max\":2.0}]");
+    ASSERT_TRUE(j.is_array());
+}
+
+/* Sub-bisection of the first freq_shifter object — strip one field at a
+ * time to isolate which specific field-combo trips the bug. */
+
+/* Two strings + three floats, no description. */
+TEST_F(McustlTestFixture, JsonParseAOO_FS1_NoDescription) {
+    json j = json::parse(
+        "[{\"name\":\"shift_hz\",\"type\":\"float\",\"min\":-500.0,\"max\":500.0,\"default\":5.0}]");
+    ASSERT_TRUE(j.is_array());
+    EXPECT_EQ(j.size(), 1u);
+}
+
+/* Two strings + one float + description. */
+TEST_F(McustlTestFixture, JsonParseAOO_FS1_OneFloat) {
+    json j = json::parse(
+        "[{\"name\":\"shift_hz\",\"type\":\"float\",\"default\":5.0,"
+        "\"description\":\"Frequency shift in Hz (positive = up-shift)\"}]");
+    ASSERT_TRUE(j.is_array());
+    EXPECT_EQ(j.size(), 1u);
+}
+
+/* No floats at all. */
+TEST_F(McustlTestFixture, JsonParseAOO_FS1_NoFloats) {
+    json j = json::parse(
+        "[{\"name\":\"shift_hz\",\"type\":\"float\","
+        "\"description\":\"Frequency shift in Hz (positive = up-shift)\"}]");
+    ASSERT_TRUE(j.is_array());
+    EXPECT_EQ(j.size(), 1u);
+}
+
+/* Just three floats, no strings. */
+TEST_F(McustlTestFixture, JsonParseAOO_FS1_OnlyFloats) {
+    json j = json::parse("[{\"min\":-500.0,\"max\":500.0,\"default\":5.0}]");
+    ASSERT_TRUE(j.is_array());
+    EXPECT_EQ(j.size(), 1u);
+}
+
+/* String, then float, then string, then float (alternating). */
+TEST_F(McustlTestFixture, JsonParseAOO_FS1_AlternatingStringFloat) {
+    json j = json::parse(
+        "[{\"name\":\"shift_hz\",\"min\":-500.0,\"type\":\"float\",\"max\":500.0}]");
+    ASSERT_TRUE(j.is_array());
+    EXPECT_EQ(j.size(), 1u);
+}
+
+/* Bisecting the freq_shifter schema: just one object, 6 mixed-type keys.
+ * If this fails, the trigger is single-object. If it passes, the trigger
+ * involves multiple objects in a row. */
+TEST_F(McustlTestFixture, JsonParseAOO_FreqShifterFirstObjectOnly) {
+    json j = json::parse(
+        "[{\"name\":\"shift_hz\",\"type\":\"float\",\"min\":-500.0,\"max\":500.0,\"default\":5.0,"
+        "\"description\":\"Frequency shift in Hz (positive = up-shift)\"}]");
+    ASSERT_TRUE(j.is_array());
+    EXPECT_EQ(j.size(), 1u);
+}
+
+/* Two objects, each 6 keys (uniform structure). */
+TEST_F(McustlTestFixture, JsonParseAOO_FreqShifterFirstAndThird) {
+    json j = json::parse(
+        "[{\"name\":\"shift_hz\",\"type\":\"float\",\"min\":-500.0,\"max\":500.0,\"default\":5.0,"
+        "\"description\":\"Frequency shift in Hz (positive = up-shift)\"},"
+        " {\"name\":\"gain\",\"type\":\"float\",\"min\":0.0,\"max\":10.0,\"default\":1.0,"
+        "\"description\":\"Output gain\"}]");
+    ASSERT_TRUE(j.is_array());
+    EXPECT_EQ(j.size(), 2u);
+}
+
+/* Two objects: first has 6 keys, second has 4 keys (the asymmetric case
+ * of freq_shifter without the third object). */
+TEST_F(McustlTestFixture, JsonParseAOO_FreqShifterFirstTwoOnly) {
+    json j = json::parse(
+        "[{\"name\":\"shift_hz\",\"type\":\"float\",\"min\":-500.0,\"max\":500.0,\"default\":5.0,"
+        "\"description\":\"Frequency shift in Hz (positive = up-shift)\"},"
+        " {\"name\":\"enabled\",\"type\":\"bool\",\"default\":true,"
+        "\"description\":\"Enable/bypass the shifter\"}]");
+    ASSERT_TRUE(j.is_array());
+    EXPECT_EQ(j.size(), 2u);
+}
+
+/* The freq_shifter schema has objects with DIFFERENT numbers of keys (6,4,6).
+ * That means each map's nodes_ allocation has a different capacity, so each
+ * insert into the array triggers different defrag patterns. Try to repro
+ * with that specific shape. */
+TEST_F(McustlTestFixture, JsonParseAOO_HeterogeneousKeyCount) {
+    json j = json::parse(
+        "[{\"a\":1,\"b\":2,\"c\":3,\"d\":4,\"e\":5,\"f\":6},"
+        " {\"a\":1,\"b\":2,\"c\":3,\"d\":4},"
+        " {\"a\":1,\"b\":2,\"c\":3,\"d\":4,\"e\":5,\"f\":6}]");
+    ASSERT_TRUE(j.is_array());
+    EXPECT_EQ(j.size(), 3u);
+    EXPECT_EQ(j[1].size(), 4u);
+    EXPECT_EQ(j[2].size(), 6u);
+}
+
+/* Same shape but with strings — strings allocate more aggressively than
+ * ints/floats, so this version puts more pressure on the heap. */
+TEST_F(McustlTestFixture, JsonParseAOO_HeterogeneousKeyCount_StringValues) {
+    json j = json::parse(
+        "[{\"a\":\"x1\",\"b\":\"x2\",\"c\":\"x3\",\"d\":\"x4\",\"e\":\"x5\",\"f\":\"x6\"},"
+        " {\"a\":\"y1\",\"b\":\"y2\",\"c\":\"y3\",\"d\":\"y4\"},"
+        " {\"a\":\"z1\",\"b\":\"z2\",\"c\":\"z3\",\"d\":\"z4\",\"e\":\"z5\",\"f\":\"z6\"}]");
+    ASSERT_TRUE(j.is_array());
+    EXPECT_EQ(j.size(), 3u);
+}
+
+TEST_F(McustlTestFixture, JsonParseAOO_LongDescriptionString) {
+    /* Long description strings are the largest allocations in the schema. */
+    json j = json::parse(
+        "[{\"description\":\"Frequency shift in Hz (positive = up-shift)\"},"
+        " {\"description\":\"Enable/bypass the shifter\"}]");
+    ASSERT_TRUE(j.is_array());
+    EXPECT_EQ(j.size(), 2u);
+}
+
+/* Reproduces a hardfault seen on the device when GET_EFFECTS_REGISTRY
+ * tried to parse one of the audio-effect parameter schemas baked into
+ * effect_registry.cpp. The fault was UNALIGNED in xQueueTakeMutexRecursive
+ * — the call site was vector<char>::~vector → heap_lock(saved_heap),
+ * with `saved_heap` containing garbage (0xC4BBB045-pattern). The call
+ * chain bottomed out in mcustl::json::parser::parse_array, so the trigger
+ * is somewhere in the cleanup path of an array-of-objects parse where
+ * each object has multiple string/number/bool keys.
+ *
+ * The schema text used here is a verbatim copy of effect_registry.cpp's
+ * "freq_shifter" entry — array of 3 objects with mixed-type fields and
+ * a multi-line description string per object. Failing this test means
+ * we've reproduced the device-side crash on host (where ASan/UBSan can
+ * pinpoint the actual UAF or double-free). Passing it means the host
+ * harness doesn't catch what the device did (different alignment, defrag
+ * trigger, etc.) and we need to widen the repro. */
+TEST_F(McustlTestFixture, JsonParseEffectParamsSchema_FreqShifter) {
+    const char* text =
+        "[{\"name\":\"shift_hz\",\"type\":\"float\",\"min\":-500.0,\"max\":500.0,\"default\":5.0,\n"
+        "  \"description\":\"Frequency shift in Hz (positive = up-shift)\"},\n"
+        " {\"name\":\"enabled\",\"type\":\"bool\",\"default\":true,\n"
+        "  \"description\":\"Enable/bypass the shifter\"},\n"
+        " {\"name\":\"gain\",\"type\":\"float\",\"min\":0.0,\"max\":10.0,\"default\":1.0,\n"
+        "  \"description\":\"Output gain\"}]";
+
+    const char* err = nullptr;
+    json j = json::parse(text, strlen(text), nullptr, &err, nullptr);
+    ASSERT_TRUE(err == nullptr) << "parse error: " << err;
+    ASSERT_TRUE(j.is_array()) << "result is not an array";
+    ASSERT_EQ(j.size(), 3u);
+
+    /* Touch each element under the heap lock — same access pattern that
+     * audio_state_serializer would have produced. */
+    mcustl::heap_guard g;
+    EXPECT_STREQ(j[0].at("name").get_string().c_str(), "shift_hz");
+    EXPECT_STREQ(j[0].at("type").get_string().c_str(), "float");
+    EXPECT_DOUBLE_EQ(j[0].at("min").get_float(), -500.0);
+    EXPECT_DOUBLE_EQ(j[0].at("default").get_float(),  5.0);
+
+    EXPECT_STREQ(j[1].at("name").get_string().c_str(), "enabled");
+    EXPECT_STREQ(j[1].at("type").get_string().c_str(), "bool");
+    EXPECT_TRUE  (j[1].at("default").get_bool());
+
+    EXPECT_STREQ(j[2].at("name").get_string().c_str(), "gain");
+    EXPECT_DOUBLE_EQ(j[2].at("max").get_float(), 10.0);
+}
+
+/* Same shape, but ALL the schemas from effect_registry.cpp parsed back
+ * to back inside one heap (mirrors buildEffectsRegistryJson which loops
+ * over the registry). If the bug is "second-or-later parse corrupts
+ * something destruction left behind", this test catches it where a
+ * single parse doesn't. */
+TEST_F(McustlTestFixture, JsonParseEffectParamsSchema_SequentialAllPresets) {
+    /* Subset of real schemas — the ones where GET_EFFECTS_REGISTRY would
+     * iterate. Picked to span: small (3 fields), medium, large nested
+     * config, and one with strings + ints. */
+    const char* schemas[] = {
+        /* freq_shifter */
+        "[{\"name\":\"shift_hz\",\"type\":\"float\",\"min\":-500.0,\"max\":500.0,\"default\":5.0,"
+        "\"description\":\"Frequency shift in Hz (positive = up-shift)\"},"
+        "{\"name\":\"enabled\",\"type\":\"bool\",\"default\":true,"
+        "\"description\":\"Enable/bypass the shifter\"},"
+        "{\"name\":\"gain\",\"type\":\"float\",\"min\":0.0,\"max\":10.0,\"default\":1.0,"
+        "\"description\":\"Output gain\"}]",
+        /* anf */
+        "[{\"name\":\"num_notches\",\"type\":\"int\",\"min\":1,\"max\":8,\"default\":4,"
+        "\"description\":\"Max simultaneous notch filters\"},"
+        "{\"name\":\"bandwidth_hz\",\"type\":\"float\",\"min\":1.0,\"max\":200.0,\"default\":50.0,"
+        "\"description\":\"Notch 3dB bandwidth in Hz\"},"
+        "{\"name\":\"threshold_db\",\"type\":\"float\",\"min\":1.0,\"max\":60.0,\"default\":15.0,"
+        "\"description\":\"PNPR detection threshold in dB\"},"
+        "{\"name\":\"confirm_frames\",\"type\":\"int\",\"min\":1,\"max\":50,\"default\":4,"
+        "\"description\":\"Frames to confirm feedback before deploying notch\"},"
+        "{\"name\":\"min_freq_hz\",\"type\":\"float\",\"min\":0.0,\"max\":20000.0,\"default\":500.0,"
+        "\"description\":\"Minimum detection frequency in Hz\"},"
+        "{\"name\":\"gain\",\"type\":\"float\",\"min\":0.0,\"max\":10.0,\"default\":1.0,"
+        "\"description\":\"Output gain\"}]",
+        /* aec — has a "string" field (reference: \"Speaker\") which exercises
+         * a slightly different parse_value branch than purely numeric defaults. */
+        "[{\"name\":\"tail_ms\",\"type\":\"int\",\"min\":20,\"max\":500,\"default\":50,"
+        "\"description\":\"Echo tail length in ms\"},"
+        "{\"name\":\"reference\",\"type\":\"string\",\"default\":\"Speaker\","
+        "\"description\":\"Output stream name for far-end reference\"},"
+        "{\"name\":\"mu\",\"type\":\"float\",\"min\":0.001,\"max\":2.0,\"default\":0.05,"
+        "\"description\":\"NLMS step size (adaptation speed)\"},"
+        "{\"name\":\"gain\",\"type\":\"float\",\"min\":0.0,\"max\":10.0,\"default\":1.0,"
+        "\"description\":\"Output gain\"}]"
+    };
+
+    /* Iterate as buildEffectsRegistryJson does: parse each schema and
+     * embed it under a per-effect "params" key. Any UAF that involves
+     * the prior parse's leftover state should fire here. */
+    json registry(json::value_t::array);
+    for (size_t i = 0; i < sizeof(schemas) / sizeof(schemas[0]); ++i) {
+        const char* err = nullptr;
+        json params = json::parse(schemas[i], strlen(schemas[i]),
+                                  nullptr, &err, nullptr);
+        ASSERT_TRUE(err == nullptr) << "schema #" << i << ": " << err;
+        ASSERT_TRUE(params.is_array()) << "schema #" << i << " not array";
+
+        json effect(json::value_t::object);
+        effect["index"]  = (int)i;
+        effect["params"] = params;     /* deep-copy; this matched the device path */
+        registry.push_back(effect);
+    }
+
+    ASSERT_EQ(registry.size(), sizeof(schemas) / sizeof(schemas[0]));
+
+    /* Roundtrip: dump the assembled registry (this is what the device
+     * sends to ESP32 via send_fragmented_locked). */
+    mcustl::string out = registry.dump(-1);
+    EXPECT_GT(out.size(), 0u);
+}
+
+/* ==================================================================
+ * Comprehensive parse/dump/copy/move coverage across shapes.
+ *
+ * The tests below stress the json/string/vector/map/pair stack along
+ * dimensions independent of any one device-specific bug:
+ *   - depth (nested arrays / nested objects / alternating)
+ *   - width (100+ siblings)
+ *   - heterogeneity (mixed types in same container)
+ *   - Unicode and escape handling
+ *   - parse↔dump roundtripping with deep equality
+ *   - copy-ctor / move-ctor / operator= on complex trees
+ *   - mutation through operator[] / push_back / erase at depth
+ *   - cumulative heap pressure across many parses
+ *   - structural edge cases (empty container at depth, null at depth)
+ * ================================================================== */
+
+/* ---- Depth ---------------------------------------------------------- */
+
+TEST_F(McustlTestFixture, JsonNested_ArraysDepth8) {
+    /* 8-level nested array. The innermost element is a leaf int.
+     * Exercises parse_array recursion + clone-on-deep-copy invariants. */
+    const char* text = "[[[[[[[[42]]]]]]]]";
+    json j = json::parse(text);
+    ASSERT_TRUE(j.is_array());
+    const json* cur = &j;
+    for (int d = 0; d < 7; ++d) {
+        ASSERT_TRUE(cur->is_array()) << "depth " << d;
+        ASSERT_EQ(cur->size(), 1u)   << "depth " << d;
+        cur = &(*cur)[0];
+    }
+    ASSERT_TRUE(cur->is_array());
+    EXPECT_EQ((*cur)[0].get_int(), 42);
+}
+
+TEST_F(McustlTestFixture, JsonNested_ObjectsDepth8) {
+    /* 8-level nested object. Each level has one key "n" mapping to the
+     * next level; innermost is an int. */
+    const char* text =
+        "{\"n\":{\"n\":{\"n\":{\"n\":{\"n\":{\"n\":{\"n\":{\"n\":99}}}}}}}}";
+    json j = json::parse(text);
+    ASSERT_TRUE(j.is_object());
+    const json* cur = &j;
+    for (int d = 0; d < 7; ++d) {
+        ASSERT_TRUE(cur->is_object()) << "depth " << d;
+        ASSERT_TRUE(cur->contains("n")) << "depth " << d;
+        cur = &cur->at("n");
+    }
+    ASSERT_TRUE(cur->is_object());
+    EXPECT_EQ(cur->at("n").get_int(), 99);
+}
+
+TEST_F(McustlTestFixture, JsonNested_AlternatingArrayObject) {
+    /* Alternating array → object → array → object × 4. */
+    const char* text =
+        "[{\"k\":[{\"k\":[{\"k\":[{\"k\":\"deep\"}]}]}]}]";
+    json j = json::parse(text);
+    ASSERT_TRUE(j.is_array());
+    const json& l1 = j[0];                 ASSERT_TRUE(l1.is_object());
+    const json& l2 = l1.at("k");           ASSERT_TRUE(l2.is_array());
+    const json& l3 = l2[0];                ASSERT_TRUE(l3.is_object());
+    const json& l4 = l3.at("k");           ASSERT_TRUE(l4.is_array());
+    const json& l5 = l4[0];                ASSERT_TRUE(l5.is_object());
+    const json& l6 = l5.at("k");           ASSERT_TRUE(l6.is_array());
+    const json& l7 = l6[0];                ASSERT_TRUE(l7.is_object());
+    EXPECT_STREQ(l7.at("k").get_string().c_str(), "deep");
+}
+
+/* ---- Width ---------------------------------------------------------- */
+
+TEST_F(McustlTestFixture, JsonWide_LargeMixedArray) {
+    /* 100-element array, alternating type per slot. Stresses vector<json>
+     * grow + element clone on deep_copy. */
+    mcustl::string text;
+    text.append('[');
+    for (int i = 0; i < 100; ++i) {
+        if (i) text.append(',');
+        switch (i % 5) {
+            case 0: text.append('1'); text.append('0'); text.append('0'); break;          /* int */
+            case 1: text.append('"'); text.append('s'); text.append('"');  break;         /* str */
+            case 2: text.append('1'); text.append('.'); text.append('5');  break;         /* float */
+            case 3: text.append('t'); text.append('r'); text.append('u'); text.append('e'); break; /* true */
+            case 4: text.append('n'); text.append('u'); text.append('l'); text.append('l'); break; /* null */
+        }
+    }
+    text.append(']');
+
+    json j = json::parse(text.c_str(), text.size());
+    ASSERT_TRUE(j.is_array());
+    EXPECT_EQ(j.size(), 100u);
+    EXPECT_EQ(j[0].get_int(), 100);
+    EXPECT_STREQ(j[1].get_string().c_str(), "s");
+    EXPECT_DOUBLE_EQ(j[2].get_float(), 1.5);
+    EXPECT_TRUE(j[3].get_bool());
+    EXPECT_TRUE(j[4].is_null());
+    EXPECT_EQ(j[95].get_int(), 100);  /* 95 % 5 == 0 */
+}
+
+TEST_F(McustlTestFixture, JsonWide_LargeObject50Keys) {
+    /* 50-key object — stresses map's red-black tree + grow path. Values
+     * are 100..149 to avoid JSON's "no leading zeros" rule (which the
+     * parser correctly enforces). */
+    mcustl::string text;
+    text.append('{');
+    for (int i = 0; i < 50; ++i) {
+        int v = 100 + i;
+        if (i) text.append(',');
+        text.append('"'); text.append('k');
+        char d1 = '0' + (i / 10);
+        char d2 = '0' + (i % 10);
+        text.append(d1); text.append(d2);
+        text.append('"'); text.append(':');
+        text.append((char)('0' + (v / 100)));
+        text.append((char)('0' + ((v / 10) % 10)));
+        text.append((char)('0' + (v % 10)));
+    }
+    text.append('}');
+
+    const char* err = nullptr;
+    json j = json::parse(text.c_str(), text.size(), nullptr, &err, nullptr);
+    ASSERT_TRUE(j.is_object()) << "parse error: " << (err ? err : "?");
+    EXPECT_EQ(j.size(), 50u);
+    EXPECT_EQ(j.at("k00").get_int(), 100);
+    EXPECT_EQ(j.at("k49").get_int(), 149);
+}
+
+/* ---- Heterogeneity -------------------------------------------------- */
+
+TEST_F(McustlTestFixture, JsonHetero_AllTypesInOneObject) {
+    /* Every json value type as a sibling — pulls every parse_value branch. */
+    const char* text =
+        "{\"n\":null,"
+        " \"b\":true,"
+        " \"i\":-2147483648,"
+        " \"u\":4294967295,"
+        " \"f\":-3.14159,"
+        " \"e\":1.5e10,"
+        " \"s\":\"\\u00E9scape\","
+        " \"arr\":[1,2,3],"
+        " \"obj\":{\"x\":1}}";
+    json j = json::parse(text);
+    ASSERT_TRUE(j.is_object());
+    EXPECT_TRUE(j.at("n").is_null());
+    EXPECT_TRUE(j.at("b").get_bool());
+    EXPECT_EQ(j.at("i").get_int(), -2147483648LL);
+    EXPECT_EQ(j.at("u").get_int(), 4294967295LL);
+    EXPECT_DOUBLE_EQ(j.at("f").get_float(), -3.14159);
+    EXPECT_DOUBLE_EQ(j.at("e").get_float(), 1.5e10);
+    EXPECT_EQ(j.at("arr").size(), 3u);
+    EXPECT_EQ(j.at("obj").at("x").get_int(), 1);
+}
+
+TEST_F(McustlTestFixture, JsonHetero_ArrayOfArrays) {
+    /* 5×5 jagged array of ints. */
+    json j = json::parse(
+        "[[1,2,3,4,5],"
+        " [10,20,30],"
+        " [100],"
+        " [],"
+        " [-1,-2,-3,-4,-5,-6]]");
+    ASSERT_TRUE(j.is_array());
+    EXPECT_EQ(j.size(), 5u);
+    EXPECT_EQ(j[0].size(), 5u);
+    EXPECT_EQ(j[2].size(), 1u);
+    EXPECT_EQ(j[3].size(), 0u);
+    EXPECT_EQ(j[4].size(), 6u);
+    EXPECT_EQ(j[4][5].get_int(), -6);
+}
+
+TEST_F(McustlTestFixture, JsonHetero_ObjectOfArraysOfObjects) {
+    /* A common "results"-style shape. */
+    const char* text =
+        "{\"users\":["
+        "  {\"id\":1,\"name\":\"alice\",\"tags\":[\"a\",\"b\"]},"
+        "  {\"id\":2,\"name\":\"bob\",\"tags\":[]},"
+        "  {\"id\":3,\"name\":\"carol\",\"tags\":[\"x\",\"y\",\"z\"]}],"
+        " \"total\":3,\"version\":\"1.0\"}";
+    json j = json::parse(text);
+    ASSERT_TRUE(j.is_object());
+    const json& u = j.at("users");
+    ASSERT_TRUE(u.is_array());
+    ASSERT_EQ(u.size(), 3u);
+    EXPECT_STREQ(u[0].at("name").get_string().c_str(), "alice");
+    EXPECT_EQ(u[1].at("tags").size(), 0u);
+    EXPECT_STREQ(u[2].at("tags")[2].get_string().c_str(), "z");
+    EXPECT_EQ(j.at("total").get_int(), 3);
+}
+
+/* ---- Unicode and escapes ------------------------------------------- */
+
+TEST_F(McustlTestFixture, JsonUnicode_MixedEscapes) {
+    json j = json::parse(
+        "{\"plain\":\"hello\","
+        " \"esc\":\"a\\\"b\\\\c\\nd\","
+        " \"u_low\":\"\\u00E9\","
+        " \"u_high\":\"\\uD83D\\uDE00\","
+        " \"empty\":\"\","
+        " \"cr_lf\":\"\\r\\n\","
+        " \"tab\":\"\\t\"}");
+    ASSERT_TRUE(j.is_object());
+    EXPECT_STREQ(j.at("plain").get_string().c_str(), "hello");
+    EXPECT_STREQ(j.at("esc").get_string().c_str(), "a\"b\\c\nd");
+    /* "é" → C3 A9 (UTF-8) */
+    const unsigned char* el = (const unsigned char*)j.at("u_low").get_string().c_str();
+    EXPECT_EQ(el[0], 0xC3u); EXPECT_EQ(el[1], 0xA9u); EXPECT_EQ(el[2], 0u);
+    /* 😀 → F0 9F 98 80 */
+    const unsigned char* eh = (const unsigned char*)j.at("u_high").get_string().c_str();
+    EXPECT_EQ(eh[0], 0xF0u); EXPECT_EQ(eh[1], 0x9Fu);
+    EXPECT_EQ(eh[2], 0x98u); EXPECT_EQ(eh[3], 0x80u);
+    EXPECT_EQ(j.at("empty").size(), 0u);
+    EXPECT_STREQ(j.at("cr_lf").get_string().c_str(), "\r\n");
+}
+
+TEST_F(McustlTestFixture, JsonUnicode_DumpEscapesProperly) {
+    /* Build a json with chars that must be escaped on dump, then parse
+     * the dump back and verify content is identical. */
+    json j(json::value_t::object);
+    j["q"]   = "with \"quotes\"";
+    j["bs"]  = "back\\slash";
+    j["nl"]  = "line\nbreak";
+    j["ctl"] = "ctl\x01x";
+
+    mcustl::string s = j.dump(-1);
+    json k = json::parse(s.c_str(), s.size());
+    ASSERT_TRUE(k.is_object());
+    EXPECT_STREQ(k.at("q").get_string().c_str(),   "with \"quotes\"");
+    EXPECT_STREQ(k.at("bs").get_string().c_str(),  "back\\slash");
+    EXPECT_STREQ(k.at("nl").get_string().c_str(),  "line\nbreak");
+    EXPECT_STREQ(k.at("ctl").get_string().c_str(), "ctl\x01x");
+}
+
+/* ---- Roundtrip parse → dump → reparse ------------------------------ */
+
+TEST_F(McustlTestFixture, JsonRoundtrip_DeeplyNested) {
+    const char* original =
+        "{\"meta\":{\"v\":1,\"by\":\"test\"},"
+        " \"data\":["
+        "   {\"k\":\"a\",\"v\":[1,2,3,{\"x\":true}]},"
+        "   {\"k\":\"b\",\"v\":[null,\"\",\"hello\"]},"
+        "   {\"k\":\"c\",\"v\":[]}],"
+        " \"counts\":[10,20,30],"
+        " \"flag\":false}";
+    json a = json::parse(original);
+    mcustl::string out = a.dump(-1);
+    json b = json::parse(out.c_str(), out.size());
+    EXPECT_TRUE(a == b)
+        << "roundtrip-equivalence broken; out=" << out.c_str();
+}
+
+TEST_F(McustlTestFixture, JsonRoundtrip_PrettyPrintEqualsCompact) {
+    const char* compact =
+        "{\"a\":1,\"b\":[2,3,{\"c\":4}],\"d\":\"x\"}";
+    json j = json::parse(compact);
+    mcustl::string p = j.dump(2);
+    json k = json::parse(p.c_str(), p.size());
+    EXPECT_TRUE(j == k);
+}
+
+/* ---- Copy / move semantics on complex trees ------------------------ */
+
+TEST_F(McustlTestFixture, JsonDeepCopy_IndependentFromSource) {
+    json orig = json::parse(
+        "{\"arr\":[1,2,3,{\"x\":\"old\"}],\"name\":\"orig\"}");
+    json copy = orig;          /* deep copy */
+
+    /* Mutate the source; copy must not see the change. */
+    orig["name"] = "changed";
+    orig["arr"][3]["x"] = "modified";
+    orig["arr"].push_back(99);
+
+    EXPECT_STREQ(copy.at("name").get_string().c_str(), "orig");
+    EXPECT_STREQ(copy.at("arr")[3].at("x").get_string().c_str(), "old");
+    EXPECT_EQ(copy.at("arr").size(), 4u);
+    EXPECT_EQ(orig.at("arr").size(), 5u);
+}
+
+TEST_F(McustlTestFixture, JsonMove_LeavesSourceEmpty) {
+    json src = json::parse("{\"a\":[1,2,3],\"b\":\"hi\"}");
+    json dst = static_cast<json&&>(src);
+    EXPECT_TRUE(dst.is_object());
+    EXPECT_EQ(dst.size(), 2u);
+    EXPECT_EQ(dst.at("a").size(), 3u);
+    /* src after move is unspecified-but-valid (mcustl convention: null) */
+    EXPECT_TRUE(src.is_null() || (src.is_object() && src.size() == 0));
+}
+
+TEST_F(McustlTestFixture, JsonAssign_ReplacesPayloadCleanly) {
+    json j = json::parse("{\"a\":[1,2,3,4,5],\"b\":{\"c\":\"d\"}}");
+    /* Replace with a smaller value — old payload must be released. */
+    j = json::parse("[42]");
+    EXPECT_TRUE(j.is_array());
+    EXPECT_EQ(j.size(), 1u);
+    EXPECT_EQ(j[0].get_int(), 42);
+}
+
+/* ---- Mutation through accessors ------------------------------------ */
+
+TEST_F(McustlTestFixture, JsonMutate_NestedObjectAssign) {
+    json j(json::value_t::object);
+    j["a"]      = json(json::value_t::object);
+    j["a"]["b"] = json(json::value_t::array);
+    j["a"]["b"].push_back(1);
+    j["a"]["b"].push_back(2);
+    j["a"]["b"].push_back(3);
+    j["a"]["c"] = "leaf";
+
+    EXPECT_EQ(j.at("a").at("b").size(), 3u);
+    EXPECT_STREQ(j.at("a").at("c").get_string().c_str(), "leaf");
+}
+
+TEST_F(McustlTestFixture, JsonMutate_ArrayPushBackMixed) {
+    json j(json::value_t::array);
+    j.push_back(1);
+    j.push_back(json("text"));
+    j.push_back(json(true));
+    j.push_back(json(json::value_t::array));
+    j.push_back(json(json::value_t::object));
+
+    ASSERT_EQ(j.size(), 5u);
+    EXPECT_TRUE(j[3].is_array());
+    EXPECT_TRUE(j[4].is_object());
+}
+
+TEST_F(McustlTestFixture, JsonMutate_EraseFromNestedObject) {
+    json j = json::parse(
+        "{\"users\":{\"alice\":1,\"bob\":2,\"carol\":3}}");
+    json& users = j.at("users");
+    EXPECT_TRUE(users.erase("bob"));
+    EXPECT_FALSE(users.contains("bob"));
+    EXPECT_TRUE(users.contains("alice"));
+    EXPECT_TRUE(users.contains("carol"));
+    EXPECT_EQ(users.size(), 2u);
+}
+
+/* ---- Iteration ----------------------------------------------------- */
+
+TEST_F(McustlTestFixture, JsonIterate_ObjectKeysVisitedOnce) {
+    json j = json::parse("{\"x\":1,\"y\":2,\"z\":3,\"a\":4,\"m\":5}");
+    int seen_x = 0, seen_y = 0, seen_z = 0, seen_a = 0, seen_m = 0;
+    for (auto it = j.begin(); it != j.end(); ++it) {
+        const auto& k = it.key();
+        if (k.size() == 1) {
+            switch (k.c_str()[0]) {
+                case 'x': ++seen_x; break;
+                case 'y': ++seen_y; break;
+                case 'z': ++seen_z; break;
+                case 'a': ++seen_a; break;
+                case 'm': ++seen_m; break;
+            }
+        }
+    }
+    EXPECT_EQ(seen_x + seen_y + seen_z + seen_a + seen_m, 5);
+    EXPECT_EQ(seen_x, 1);
+    EXPECT_EQ(seen_a, 1);
+}
+
+TEST_F(McustlTestFixture, JsonIterate_NestedArrayWalk) {
+    json j = json::parse("[[1,2],[3,4],[5,6]]");
+    int sum = 0;
+    for (size_t i = 0; i < j.size(); ++i) {
+        for (size_t k = 0; k < j[i].size(); ++k) {
+            sum += (int)j[i][k].get_int();
+        }
+    }
+    EXPECT_EQ(sum, 1+2+3+4+5+6);
+}
+
+/* ---- Stress / heap pressure ---------------------------------------- */
+
+TEST_F(McustlTestFixture, JsonStress_RepeatedParseAndDiscard) {
+    /* 100 parses of a moderately complex shape. The temporary tree is
+     * destroyed at the end of each iteration; cumulative defrag activity
+     * must not corrupt the heap. */
+    const char* text =
+        "{\"a\":[1,2,3,{\"x\":\"hello\",\"y\":[true,false,null]}],"
+        " \"b\":{\"k1\":\"v1\",\"k2\":\"v2\",\"k3\":[\"a\",\"b\",\"c\"]}}";
+    for (int i = 0; i < 100; ++i) {
+        json j = json::parse(text);
+        ASSERT_TRUE(j.is_object()) << "iter " << i;
+        ASSERT_EQ(j.at("a").size(), 4u) << "iter " << i;
+        ASSERT_EQ(j.at("b").at("k3").size(), 3u) << "iter " << i;
+    }
+}
+
+TEST_F(McustlTestFixture, JsonStress_ParseAndCopy) {
+    /* Parse once, then copy 50 times. Each copy is a deep copy; the
+     * source must remain intact. */
+    json src = json::parse(
+        "{\"data\":[" "{\"id\":1,\"name\":\"alpha\",\"tags\":[\"x\",\"y\"]},"
+                     "{\"id\":2,\"name\":\"beta\",\"tags\":[]}"
+        "],\"meta\":{\"total\":2}}");
+    for (int i = 0; i < 50; ++i) {
+        json copy = src;
+        ASSERT_EQ(copy.at("data").size(), 2u) << "iter " << i;
+        EXPECT_STREQ(copy.at("data")[0].at("name").get_string().c_str(), "alpha");
+    }
+    /* Source still pristine. */
+    EXPECT_STREQ(src.at("data")[1].at("name").get_string().c_str(), "beta");
+}
+
+TEST_F(McustlTestFixture, JsonStress_BuildBigTreeIncrementally) {
+    /* Build an array of 50 objects with varying contents via mutation
+     * APIs. Tests grow + insert + push_back combined. */
+    json arr(json::value_t::array);
+    for (int i = 0; i < 50; ++i) {
+        json o(json::value_t::object);
+        o["i"]    = i;
+        o["sq"]   = i * i;
+        o["even"] = (i % 2 == 0);
+        json sub(json::value_t::array);
+        for (int k = 0; k < (i % 5); ++k) sub.push_back(k);
+        o["sub"] = sub;
+        arr.push_back(o);
+    }
+    EXPECT_EQ(arr.size(), 50u);
+    EXPECT_EQ(arr[10].at("sq").get_int(), 100);
+    EXPECT_EQ(arr[10].at("sub").size(), 0u);    /* 10 % 5 == 0 */
+    EXPECT_EQ(arr[12].at("sub").size(), 2u);    /* 12 % 5 == 2 */
+    EXPECT_TRUE(arr[20].at("even").get_bool());
+}
+
+/* ---- Edge cases ---------------------------------------------------- */
+
+TEST_F(McustlTestFixture, JsonEdge_EmptyContainerAtDepth) {
+    /* Empty containers at various nesting depths. */
+    json j = json::parse("[[],{},[{}],[{\"k\":[]}]]");
+    EXPECT_EQ(j.size(), 4u);
+    EXPECT_TRUE(j[0].is_array());     EXPECT_EQ(j[0].size(), 0u);
+    EXPECT_TRUE(j[1].is_object());    EXPECT_EQ(j[1].size(), 0u);
+    EXPECT_TRUE(j[2][0].is_object()); EXPECT_EQ(j[2][0].size(), 0u);
+    EXPECT_TRUE(j[3][0].at("k").is_array()); EXPECT_EQ(j[3][0].at("k").size(), 0u);
+}
+
+TEST_F(McustlTestFixture, JsonEdge_NullAtVariousPositions) {
+    json j = json::parse("[null,{\"a\":null,\"b\":[null,null]},null]");
+    EXPECT_TRUE(j[0].is_null());
+    EXPECT_TRUE(j[1].at("a").is_null());
+    EXPECT_TRUE(j[1].at("b")[0].is_null());
+    EXPECT_TRUE(j[1].at("b")[1].is_null());
+    EXPECT_TRUE(j[2].is_null());
+}
+
+TEST_F(McustlTestFixture, JsonEdge_StringsOfManyLengths) {
+    /* Strings spanning the boundaries where vector<char> reserves
+     * different capacities. */
+    mcustl::string text;
+    text.append('[');
+    for (int len : {0, 1, 2, 3, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128}) {
+        if (text.size() > 1) text.append(',');
+        text.append('"');
+        for (int k = 0; k < len; ++k) {
+            text.append((char)('a' + (k % 26)));
+        }
+        text.append('"');
+    }
+    text.append(']');
+
+    json j = json::parse(text.c_str(), text.size());
+    ASSERT_TRUE(j.is_array());
+    EXPECT_EQ(j.size(), 14u);
+    EXPECT_EQ(j[0].get_string().size(), 0u);
+    EXPECT_EQ(j[13].get_string().size(), 128u);
+    /* Spot-check content. */
+    EXPECT_EQ(j[7].get_string().c_str()[0], 'a');
+    EXPECT_EQ(j[7].get_string().c_str()[15], 'p');  /* 'a'+(15%26)='p' */
+}
+
+TEST_F(McustlTestFixture, JsonEdge_NumericPrecision) {
+    /* Integers at edges (within int64 range and without overflow during
+     * accumulation), float with many digits, scientific notation.
+     *
+     * Note: parsing INT64_MAX (`9223372036854775807`) currently overflows
+     * during accumulation and folds to INT64_MIN — a separate parser
+     * issue worth a dedicated bug. The comfortable bound here stays
+     * inside ~2^61 to keep the test focused on precision, not parser
+     * overflow. */
+    json j = json::parse(
+        "[0,-1,1,1000000000000000,-1000000000000000,"
+        " 0.1,3.141592653589793,1e-9,2.5e15,-1.5e-300]");
+    EXPECT_EQ(j[0].get_int(),  0);
+    EXPECT_EQ(j[1].get_int(), -1);
+    EXPECT_EQ(j[2].get_int(),  1);
+    EXPECT_EQ(j[3].get_int(),  1000000000000000LL);
+    EXPECT_EQ(j[4].get_int(), -1000000000000000LL);
+    EXPECT_DOUBLE_EQ(j[5].get_float(), 0.1);
+    EXPECT_DOUBLE_EQ(j[6].get_float(), 3.141592653589793);
+    EXPECT_DOUBLE_EQ(j[7].get_float(), 1e-9);
+    EXPECT_DOUBLE_EQ(j[8].get_float(), 2.5e15);
+    /* 1.5e-300 may underflow; just check it parsed without error. */
+    EXPECT_TRUE(j[9].is_number_float());
+}
+
+/* ---- Mixed parse + mutate + dump pipeline -------------------------- */
+
+TEST_F(McustlTestFixture, JsonPipeline_ParseMutateDumpReparseEqual) {
+    /* Realistic flow: parse incoming, modify, serialize for downstream. */
+    json j = json::parse(
+        "{\"items\":[{\"id\":1,\"qty\":10},{\"id\":2,\"qty\":20}],"
+        " \"total\":30}");
+    /* Add a new item; bump total. */
+    {
+        json item(json::value_t::object);
+        item["id"]  = 3;
+        item["qty"] = 5;
+        j["items"].push_back(item);
+    }
+    j["total"] = 35;
+
+    mcustl::string out = j.dump(-1);
+    json k = json::parse(out.c_str(), out.size());
+    EXPECT_EQ(k.at("items").size(), 3u);
+    EXPECT_EQ(k.at("items")[2].at("id").get_int(), 3);
+    EXPECT_EQ(k.at("total").get_int(), 35);
+}
+
 /* Repeat the parse + walk many times in the same heap. Cumulative
  * defrag activity may expose timing-dependent issues that a single
  * parse misses. Mimics a long-running device that re-loads config. */

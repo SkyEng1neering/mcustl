@@ -82,16 +82,35 @@ inline heap_t* heap_for(A& a, B& b, const A& a2, const B& b2) {
 
 template<typename A, typename B>
 struct pair {
-    A first;
-    B second;
+    /* Anonymous unions wrap the two members so the compiler-emitted
+     * implicit destructor is NOT generated (a struct with a union of
+     * non-trivially-destructible types has no implicit dtor). That puts
+     * lifetime under our control: we explicitly construct in every ctor
+     * and destruct in ~pair under tracked_this, so a defrag fired by
+     * ~B can relocate `self` and ~A still runs on the new pair address.
+     *
+     * Access to `first`/`second` is unchanged because anonymous unions
+     * inject member names into the enclosing scope.
+     *
+     * Layout is identical to a plain `A first; B second;`: each anonymous
+     * union with a single member has the same size+alignment as that
+     * member. */
+    union { A first; };
+    union { B second; };
 
-    /* Default ctor: trivial init, no defrag concern. */
-    pair() : first(), second() {}
+    /* Default ctor: explicitly construct each member; trivial init for
+     * heap-aware types (default_heap pickup), no defrag concern. */
+    pair() {
+        new (static_cast<void*>(&first))  A();
+        new (static_cast<void*>(&second)) B();
+    }
 
     /* Value ctors: default-init fields in the init list, then assign in the
      * body under tracked_this so a defrag triggered by `first = a` doesn't
      * leave `&this->second` stale. */
-    pair(const A& a, const B& b) : first(), second() {
+    pair(const A& a, const B& b) {
+        new (static_cast<void*>(&first))  A();
+        new (static_cast<void*>(&second)) B();
         pair* self = this;
         ::mcustl::tracked_this<pair> _t(self,
             pair_detail::heap_for(self->first, self->second,
@@ -100,7 +119,9 @@ struct pair {
         self->second = b;
     }
 
-    pair(const A& a, B&& b) : first(), second() {
+    pair(const A& a, B&& b) {
+        new (static_cast<void*>(&first))  A();
+        new (static_cast<void*>(&second)) B();
         pair* self = this;
         ::mcustl::tracked_this<pair> _t(self,
             pair_detail::heap_for(self->first, self->second,
@@ -109,7 +130,9 @@ struct pair {
         self->second = static_cast<B&&>(b);
     }
 
-    pair(A&& a, B&& b) : first(), second() {
+    pair(A&& a, B&& b) {
+        new (static_cast<void*>(&first))  A();
+        new (static_cast<void*>(&second)) B();
         pair* self = this;
         ::mcustl::tracked_this<pair> _t(self,
             pair_detail::heap_for(self->first, self->second,
@@ -119,7 +142,9 @@ struct pair {
     }
 
     /* Copy ctor: default-init then copy-assign each field under the guard. */
-    pair(const pair& other) : first(), second() {
+    pair(const pair& other) {
+        new (static_cast<void*>(&first))  A();
+        new (static_cast<void*>(&second)) B();
         pair* self = this;
         ::mcustl::tracked_this<pair> _t(self,
             pair_detail::heap_for(self->first, self->second,
@@ -129,7 +154,9 @@ struct pair {
     }
 
     /* Move ctor: same pattern as copy. */
-    pair(pair&& other) noexcept : first(), second() {
+    pair(pair&& other) noexcept {
+        new (static_cast<void*>(&first))  A();
+        new (static_cast<void*>(&second)) B();
         pair* self = this;
         ::mcustl::tracked_this<pair> _t(self,
             pair_detail::heap_for(self->first, self->second,
@@ -160,6 +187,33 @@ struct pair {
             self->second = static_cast<B&&>(other.second);
         }
         return *this;
+    }
+
+    /* Explicit destructor with tracked_this — necessary because ~B() (run
+     * first by reverse-declaration-order) can dfree+defrag, relocating
+     * the pair away from the original `this`. Without tracking, the
+     * compiler-emitted auto-destruction of `first` would then run on the
+     * stale `this` address — operating on a freed (or reused) byte
+     * region whose alloc_mem_ptr lookalike happens to be garbage from
+     * the next allocation. Symptom: SEGV in heap_lock during
+     * vector<char>::~vector inside ~string inside ~pair, with
+     * `saved_heap` showing two adjacent uint32 values from another
+     * vector that landed on top of the freed pair. Reproduced by
+     * test_json.cpp::JsonParseAOO_MinimalRepro_2str3float.
+     *
+     * Pattern: drive both sub-destructions from the tracked `self`
+     * pointer, then placement-new default-constructed instances back
+     * into self's slots so the compiler's automatic member destruction
+     * (which still runs on the original `this`) sees a default-init
+     * byte pattern at whatever address it lands on — for default
+     * mcustl-types, ~vector / ~string skip the heap_lock branch
+     * entirely (container_ptr == NULL). */
+    ~pair() {
+        pair* self = this;
+        ::mcustl::tracked_this<pair> _t(self,
+            pair_detail::heap_for(self->first, self->second));
+        self->second.~B();
+        self->first.~A();
     }
 
     bool operator==(const pair& other) const {

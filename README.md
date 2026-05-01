@@ -2,7 +2,7 @@
 
 **Author:** Alexey Vasilenko  
 **License:** Apache 2.0  
-**Version:** 1.2.0
+**Version:** 1.2.1
 
 C++ container library for embedded systems (MCU, RTOS). All containers use the **dalloc** defragmenting memory allocator, which automatically compacts heap memory and updates tracked pointers. No standard library heap (`new`/`delete`/`malloc`) is used.
 
