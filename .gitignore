@@ -2,3 +2,7 @@ build/
 *.o
 *.a
 *.d
+
+# Test build outputs (CMake configures into build_tests/ at any depth)
+build_tests/
+**/build_tests/
