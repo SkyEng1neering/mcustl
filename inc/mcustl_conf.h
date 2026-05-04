@@ -68,7 +68,7 @@ extern "C" {
 /* ==================== Library Version ==================== */
 
 #ifndef MCUSTL_VERSION
-#define MCUSTL_VERSION                      "1.2.1"
+#define MCUSTL_VERSION                      "1.2.2"
 #endif
 
 /* ==================== Module Enable/Disable ==================== */
@@ -133,6 +133,70 @@ extern "C" {
 /* Maximum number of simultaneous allocations */
 #ifndef MAX_NUM_OF_ALLOCATIONS
 #define MAX_NUM_OF_ALLOCATIONS              100UL
+#endif
+
+/* Maximum number of simultaneously-active pseudo-trackers (RAII guards
+ * registered by `register_pseudo_tracker` from tracked_this /
+ * tracked_heap_ptr). These are stack-local scope guards used by the
+ * containers to follow `*this` (and a few other stack-local pointers)
+ * across defrag relocations.
+ *
+ * Stored in a SEPARATE array from real allocations so a transient burst
+ * of pseudo-trackers (deep recursive json/map/string operations) cannot
+ * compete with real allocations for slot capacity. If this cap is
+ * exceeded, register silently drops — same as the legacy behaviour —
+ * and you'll see the classic stale-this corruption symptoms (NULL
+ * c_str(), garbage heap_ pointer, etc.). Bump it if you hit that.
+ *
+ * Default 64 covers comfortable call-stack depth with a few pseudo-
+ * trackers per frame. */
+#ifndef MAX_NUM_OF_PSEUDO_TRACKERS
+#define MAX_NUM_OF_PSEUDO_TRACKERS          64UL
+#endif
+
+/* Storage attribute for the static `default_heap` instance in
+ * mcustl_alloc.c.
+ *
+ * Defaulting to "no attribute" places the struct in regular .bss,
+ * which on most embedded link scripts means whatever section
+ * `.bss` resolves to. With a tight MAX_NUM_OF_* setting the struct
+ * is small (a few KB) and that's fine, but bumping the limits to
+ * accommodate a heavy workload can push it into the multi-KB range
+ * — at which point you usually want to relocate it into a roomier
+ * RAM region (e.g. AXI/D1 SRAM on STM32H7).
+ *
+ * Override in your custom conf:
+ *   #define MCUSTL_DEFAULT_HEAP_ATTR \
+ *       __attribute__((section(".my_section"), aligned(32)))
+ */
+#ifndef MCUSTL_DEFAULT_HEAP_ATTR
+#define MCUSTL_DEFAULT_HEAP_ATTR
+#endif
+
+/* Hook fired by register_pseudo_tracker when the pseudo-tracker array
+ * is full. Default no-op (the dropped registration silently leaves a
+ * stale-this UAF risk). Override in a project conf to log/assert/panic
+ * — recommended on device builds where the silent drop is the actual
+ * bug we're trying to surface. */
+#ifndef MCUSTL_PSEUDO_TRACKER_OVERFLOW_HOOK
+#define MCUSTL_PSEUDO_TRACKER_OVERFLOW_HOOK() ((void)0)
+#endif
+
+/* Hook fired by dalloc when the request can't be served — either because
+ * MAX_NUM_OF_ALLOCATIONS was reached or because the heap doesn't have
+ * `size` bytes free. Default no-op. Override in a project conf to surface
+ * the failure in release builds (mcustl_debug is typically a no-op then,
+ * so the only visible symptom is downstream — truncated JSON, NULL
+ * dereference, or a hang).
+ *
+ * Arguments:
+ *   heap        — heap_t* the call targeted
+ *   size        — size in bytes the caller asked for
+ *   new_offset  — would-be offset after the alignment-rounded allocation
+ *                 (compare against heap->total_size to tell heap exhaustion
+ *                 from tracker-array exhaustion). */
+#ifndef MCUSTL_DALLOC_OVERFLOW_HOOK
+#define MCUSTL_DALLOC_OVERFLOW_HOOK(heap, size, new_offset) ((void)0)
 #endif
 
 /* ==================== Alignment Configuration ==================== */

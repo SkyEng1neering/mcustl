@@ -51,6 +51,14 @@ typedef struct {
 typedef struct {
     ptr_info_t ptr_info_arr[MAX_NUM_OF_ALLOCATIONS];
     uint32_t allocations_num;
+    /* Pseudo-trackers — stack-local pointers registered by tracked_this
+     * / tracked_heap_ptr. Kept separate from real allocations so a deep
+     * call stack with many transient guards can't exhaust the real-
+     * allocation slot budget (which causes silent register drops →
+     * stale-this UAF). See MAX_NUM_OF_PSEUDO_TRACKERS. */
+    ptr_info_t pseudo_tracker_arr[MAX_NUM_OF_PSEUDO_TRACKERS];
+    uint32_t pseudo_trackers_num;
+    uint32_t max_pseudo_trackers_amount;
     uint32_t max_memory_amount;
     uint32_t max_allocations_amount;
 } alloc_info_t;

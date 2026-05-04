@@ -22,6 +22,41 @@
 
 namespace mcustl {
 
+/* RAII pseudo-tracker for a stack-local pointer that aliases a heap
+ * buffer. Defrag's value-shift pass keeps `*ptr_slot` valid across any
+ * dfree+memmove triggered while the guard is alive — without this, a
+ * `const char* p = src.data()` snapshot at the start of a copy/append
+ * loop goes stale the first time push_back grows.
+ *
+ * Pass the heap that owns the buffer `*ptr_slot` points into. If null
+ * (pre-allocation lazy state), we fall back to the default heap, which
+ * is where mcustl tracks the buffer in single-heap mode anyway. If
+ * `*ptr_slot` itself is null (empty source), we skip registration —
+ * the caller's loop will execute zero iterations and there's nothing
+ * to track. */
+class tracked_heap_ptr {
+public:
+    tracked_heap_ptr(heap_t* h, const char** ptr_slot) noexcept
+        : slot_(reinterpret_cast<void**>(const_cast<char**>(ptr_slot))) {
+        if (!slot_ || !*slot_) return;
+        heap_ = h ? h : mcustl_get_default_heap();
+        if (!heap_) return;
+        register_pseudo_tracker(heap_, slot_);
+        armed_ = true;
+    }
+    ~tracked_heap_ptr() noexcept {
+        if (armed_) {
+            unregister_pseudo_tracker(heap_, slot_);
+        }
+    }
+    tracked_heap_ptr(const tracked_heap_ptr&)            = delete;
+    tracked_heap_ptr& operator=(const tracked_heap_ptr&) = delete;
+private:
+    void**  slot_;
+    heap_t* heap_  = nullptr;
+    bool    armed_ = false;
+};
+
 char& string::at(uint32_t i){
 	return ch_container.at(i);
 }
@@ -114,26 +149,34 @@ bool string::pop_back(){
 }
 
 bool string::append(const char *str){
-	/* push_back loop may dfree+defrag and relocate `*this`. */
+	/* push_back loop may dfree+defrag and relocate `*this`. The same
+	 * defrag may relocate the buffer `str` aliases (when `str` came
+	 * from another mcustl string in heap). Pseudo-track our local copy
+	 * of `str` so it follows that buffer through any number of moves. */
 	MCUSTL_TRACKED_THIS(string, this->ch_container.get_mem_pointer());
-	uint32_t ind = 0;
-	if(str[ind] == '\0'){
+	if(str[0] == '\0'){
 		return false;
 	}
-	while(str[ind] != '\0'){
-		if(self->push_back(str[ind]) != true){
+	const char* p = str;
+	tracked_heap_ptr _tp(self->ch_container.get_mem_pointer(), &p);
+	while(*p != '\0'){
+		char ch = *p;
+		if(self->push_back(ch) != true){
 			return false;
 		}
-		ind++;
+		++p;
 	}
 	return true;
 }
 
 bool string::append(char *str, uint32_t str_len){
-	/* push_back loop may dfree+defrag and relocate `*this`. */
+	/* See append(const char*) — same heap-relocation hazard for `str`. */
 	MCUSTL_TRACKED_THIS(string, this->ch_container.get_mem_pointer());
+	const char* p = str;
+	tracked_heap_ptr _tp(self->ch_container.get_mem_pointer(), &p);
 	for(uint32_t i = 0; i < str_len; i++){
-		if(self->push_back(str[i]) != true){
+		char ch = p[i];
+		if(self->push_back(ch) != true){
 			return false;
 		}
 	}
@@ -145,13 +188,28 @@ bool string::append(const char *str, uint32_t str_len){
 }
 
 bool string::append(const string& str){
-	/* reserve + append both may dfree+defrag and relocate `*this`. */
+	/* reserve + push_back loop both may dfree+defrag and relocate
+	 * `*this`. The same defrag may also relocate `str` itself when it's
+	 * a heap-resident object (e.g. a key stored inside a map node), so
+	 * we cannot read through `str` after the first allocation here.
+	 * Snapshot src_data + size at function entry while `str` is still
+	 * valid, then pseudo-track src_data through the rest. */
 	MCUSTL_TRACKED_THIS(string, this->ch_container.get_mem_pointer());
 	uint32_t str_len = str.size();
+	const char* src_data = str.c_str();
+
+	heap_t* h = self->ch_container.get_mem_pointer();
+	tracked_heap_ptr _tp(h, &src_data);
+
 	if(self->reserve(self->size() + str_len) != true){
 		return false;
 	}
-	return self->append(str.c_str(), str_len);
+	for (uint32_t i = 0; i < str_len; i++) {
+		if (!self->push_back(src_data[i])) {
+			return false;
+		}
+	}
+	return true;
 }
 
 bool string::append(char ch){
@@ -200,8 +258,13 @@ bool string::operator!=(string &name) const {
 
 bool string::operator<(const string &other) const {
 	uint32_t min_len = size() < other.size() ? size() : other.size();
-	int cmp = strncmp(ch_container.data(), other.data(), min_len);
-	if (cmp != 0) return cmp < 0;
+	/* strncmp(NULL, NULL, 0) is UB per the C standard even though the
+	 * result is trivially 0 — guard so empty-string comparisons (real
+	 * for fresh map keys / cleared strings) don't trip UBSan. */
+	if (min_len > 0) {
+		int cmp = strncmp(ch_container.data(), other.data(), min_len);
+		if (cmp != 0) return cmp < 0;
+	}
 	return size() < other.size();
 }
 
@@ -299,20 +362,34 @@ string::string(const char *str){
 }
 
 string::string(const string &other){
-    /* push_back loop may dfree+defrag and relocate `*this`. */
+    /* push_back loop may dfree+defrag and relocate `*this` and ALSO
+     * relocate `other` when it lives in heap. Snapshot src state and
+     * pseudo-track the source buffer; then never read through `other`. */
     MCUSTL_TRACKED_THIS(string, this->ch_container.get_mem_pointer());
-    for(uint32_t i = 0; i < other.size(); i++){
-        self->push_back(other.data()[i]);
+    uint32_t      src_size = other.size();
+    const char*   src_data = other.data();
+
+    heap_t* h = this->ch_container.get_mem_pointer();
+    tracked_heap_ptr _tp(h, &src_data);
+
+    for(uint32_t i = 0; i < src_size; i++){
+        self->push_back(src_data[i]);
     }
 }
 
 string& string::operator = (const string &other){
     if(&other != this){
-        /* clear + push_back loop may dfree+defrag and relocate `*this`. */
+        /* See copy ctor — same heap-relocation hazard for `other`. */
         MCUSTL_TRACKED_THIS(string, this->ch_container.get_mem_pointer());
+        uint32_t      src_size = other.size();
+        const char*   src_data = other.data();
+
+        heap_t* h = this->ch_container.get_mem_pointer();
+        tracked_heap_ptr _tp(h, &src_data);
+
         self->clear();
-        for(uint32_t i = 0; i < other.size(); i++){
-            self->push_back(other.data()[i]);
+        for(uint32_t i = 0; i < src_size; i++){
+            self->push_back(src_data[i]);
         }
     }
     return *this;
@@ -369,21 +446,35 @@ string::string(const char *str, heap_t *_alloc_mem_ptr){
 
 string::string(const string &other){
     this->assign_mem_pointer(other.get_mem_pointer());
-    /* push_back loop may dfree+defrag and relocate `*this`. */
+    /* push_back loop may dfree+defrag and relocate `*this` and ALSO
+     * relocate `other` when other lives in heap (e.g. a key stored inside
+     * a map node). Snapshot other's state up-front and pseudo-track the
+     * source buffer pointer on its OWNING heap; then we never read
+     * through `other` again. */
     MCUSTL_TRACKED_THIS(string, this->ch_container.get_mem_pointer());
-    for(uint32_t i = 0; i < other.size(); i++){
-        self->push_back(other.data()[i]);
+    uint32_t      src_size = other.size();
+    const char*   src_data = other.data();
+    heap_t*       src_heap = other.get_mem_pointer();
+    tracked_heap_ptr _tp(src_heap, &src_data);
+
+    for(uint32_t i = 0; i < src_size; i++){
+        self->push_back(src_data[i]);
     }
 }
 
 string& string::operator = (const string &other){
     if(&other != this){
         this->assign_mem_pointer(other.get_mem_pointer());
-        /* clear + push_back loop may dfree+defrag and relocate `*this`. */
+        /* See copy ctor — same heap-relocation hazard for `other`. */
         MCUSTL_TRACKED_THIS(string, this->ch_container.get_mem_pointer());
+        uint32_t      src_size = other.size();
+        const char*   src_data = other.data();
+        heap_t*       src_heap = other.get_mem_pointer();
+        tracked_heap_ptr _tp(src_heap, &src_data);
+
         self->clear();
-        for(uint32_t i = 0; i < other.size(); i++){
-            self->push_back(other.data()[i]);
+        for(uint32_t i = 0; i < src_size; i++){
+            self->push_back(src_data[i]);
         }
     }
     return *this;

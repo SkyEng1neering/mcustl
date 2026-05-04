@@ -1771,3 +1771,292 @@ TEST_F(McustlTestFixture, JsonParseDeviceConfigShape_RepeatedParseLoop) {
             << "round " << round;
     }
 }
+
+/* Schemas sized to match real effect_registry.cpp entries on the device
+ * (multi-KB JSON arrays with descriptions). The exact text doesn't
+ * matter — what matters is that parsing + assigning each one churns
+ * the heap a lot. */
+static const char* kSchemaLarge =
+    "[{\"name\":\"freq_shifter.shift_hz\",\"type\":\"float\",\"min\":1.0,\"max\":20.0,\"default\":10.0,"
+      "\"description\":\"Preventive shift amount in Hz, fairly long descriptive text to bloat allocations\"},"
+     "{\"name\":\"freq_shifter.enabled\",\"type\":\"bool\",\"default\":true,"
+      "\"description\":\"Enable/bypass the shifter, more text to grow the schema\"},"
+     "{\"name\":\"freq_shifter.gain\",\"type\":\"float\",\"min\":0.0,\"max\":10.0,\"default\":1.0,"
+      "\"description\":\"Freq shifter output gain with a long-enough description string\"},"
+     "{\"name\":\"anf.num_notches\",\"type\":\"int\",\"min\":1,\"max\":8,\"default\":6,"
+      "\"description\":\"Max simultaneous notch filters running concurrently\"},"
+     "{\"name\":\"anf.bandwidth_hz\",\"type\":\"float\",\"min\":1.0,\"max\":200.0,\"default\":50.0,"
+      "\"description\":\"Notch 3dB bandwidth in Hz, used by the adaptive engine\"},"
+     "{\"name\":\"anf.threshold_db\",\"type\":\"float\",\"min\":1.0,\"max\":60.0,\"default\":15.0,"
+      "\"description\":\"PNPR detection threshold in dB above noise floor\"},"
+     "{\"name\":\"anf.confirm_frames\",\"type\":\"int\",\"min\":1,\"max\":50,\"default\":4,"
+      "\"description\":\"Frames to confirm feedback before deploying notch and stealing CPU\"},"
+     "{\"name\":\"anf.min_freq_hz\",\"type\":\"float\",\"min\":0.0,\"max\":20000.0,\"default\":800.0,"
+      "\"description\":\"Min tracking frequency, ignore detections below this band\"},"
+     "{\"name\":\"anf.gain\",\"type\":\"float\",\"min\":0.0,\"max\":10.0,\"default\":1.0,"
+      "\"description\":\"ANF output gain post-notching\"},"
+     "{\"name\":\"level_guard.threshold_db_sec\",\"type\":\"float\",\"min\":5.0,\"max\":500.0,\"default\":40.0,"
+      "\"description\":\"Max allowed level rise rate in dB per second\"},"
+     "{\"name\":\"level_guard.hold_ms\",\"type\":\"float\",\"min\":50.0,\"max\":2000.0,\"default\":300.0,"
+      "\"description\":\"Hold time after detection before release in ms\"},"
+     "{\"name\":\"level_guard.min_gain\",\"type\":\"float\",\"min\":0.001,\"max\":1.0,\"default\":0.05,"
+      "\"description\":\"Level guard gain floor (0.05 == -26 dB)\"},"
+     "{\"name\":\"biquad.frequency\",\"type\":\"float\",\"min\":1000.0,\"max\":20000.0,\"default\":7000.0,"
+      "\"description\":\"Low-pass cutoff frequency in Hz for the post filter\"},"
+     "{\"name\":\"biquad.Q\",\"type\":\"float\",\"min\":0.1,\"max\":5.0,\"default\":0.707,"
+      "\"description\":\"Filter Q (0.707 = Butterworth, no resonance hump)\"},"
+     "{\"name\":\"biquad.gain\",\"type\":\"float\",\"min\":0.0,\"max\":10.0,\"default\":1.0,"
+      "\"description\":\"LPF output gain\"}]";
+
+static const char* kSchemaMedium =
+    "[{\"name\":\"semitones\",\"type\":\"int\",\"min\":-12,\"max\":12,\"default\":-3,"
+      "\"description\":\"Pitch shift in semitones (negative = down, positive = up)\"},"
+     "{\"name\":\"mix\",\"type\":\"float\",\"min\":0.0,\"max\":1.0,\"default\":1.0,"
+      "\"description\":\"Wet/dry mix amount\"}]";
+
+static const char* kSchemaSmall = "[]";
+
+/* Reproduction of an STM32 BusFault in `audio_state_serializer::
+ * buildEffectsRegistryJson` (exciter-mini). The crash signature was
+ *   register_pseudo_tracker -> tracked_this<json> -> json::operator[] ->
+ *   json::operator= -> buildEffectsRegistryJson  (heap_struct_ptr garbage)
+ * i.e. a slot returned by `effect[key]` had its `heap_` field overwritten
+ * by the time `operator=` later read it back via `effective_heap()`.
+ *
+ * The structural ingredients of the device-side path:
+ *   - outer heap_guard (handle_get_snapshot)
+ *   - inner heap_guard (buildEffectsRegistryJson)        — nested guards
+ *   - per-iteration local `effect` json built by appending several
+ *     string-valued keys, then parsing a schema literal into a temp,
+ *     then assigning the temp into effect["params"]
+ *   - effects.push_back(effect)
+ * Looping that with the realistic number of entries (~40) and KB-scale
+ * schemas is what shakes loose the latent UAF / stale-slot in the
+ * json/map combination.
+ */
+TEST_F(McustlTestFixture, JsonBuildEffectsRegistryRepro) {
+    /* Mimic handle_get_snapshot's outer heap_guard. */
+    mcustl::heap_guard outer;
+
+    json snapshot;
+
+    /* Mimic buildEffectsRegistryJson: nested heap_guard + the same
+     * sequence of mutations on `out`. */
+    {
+        mcustl::heap_guard inner;
+
+        snapshot = json(json::value_t::object);
+
+        /* Limits sub-object (tiny but exercises a fresh nested
+         * object_t under the inner guard). */
+        {
+            json limits(json::value_t::object);
+            limits["max_modifiers_per_stream"] = 8;
+            snapshot["limits"] = limits;
+        }
+
+        json effects(json::value_t::array);
+
+        /* ~40 entries to match the device's effect registry, with
+         * KB-scale schemas. */
+        struct EffectFixture { const char* name; const char* schema; };
+        static const EffectFixture FIXTURES[] = {
+            { "freq_shifter",         kSchemaLarge  },
+            { "anf",                  kSchemaLarge  },
+            { "feedback_suppressor",  kSchemaLarge  },
+            { "aec",                  kSchemaLarge  },
+            { "level_guard",          kSchemaLarge  },
+            { "pitch_down",           kSchemaMedium },
+            { "pitch_up",             kSchemaMedium },
+            { "robot",                nullptr       },
+            { "chorus",               kSchemaMedium },
+            { "tremolo",              kSchemaMedium },
+            { "lpf",                  kSchemaMedium },
+            { "hpf",                  kSchemaMedium },
+            { "bpf",                  kSchemaMedium },
+            { "notch",                kSchemaMedium },
+            { "delay",                kSchemaLarge  },
+            { "reverb",               kSchemaLarge  },
+            { "compressor",           kSchemaLarge  },
+            { "limiter",              kSchemaLarge  },
+            { "expander",             kSchemaLarge  },
+            { "gate",                 kSchemaMedium },
+            { "eq_3band",             kSchemaLarge  },
+            { "eq_5band",             kSchemaLarge  },
+            { "distortion",           kSchemaMedium },
+            { "overdrive",            kSchemaMedium },
+            { "fuzz",                 kSchemaSmall  },
+            { "bitcrusher",           kSchemaMedium },
+            { "ring_mod",             kSchemaMedium },
+            { "vibrato",              kSchemaMedium },
+            { "flanger",              kSchemaLarge  },
+            { "phaser",               kSchemaLarge  },
+            { "wah",                  kSchemaMedium },
+            { "auto_wah",             kSchemaLarge  },
+            { "octave_up",            kSchemaSmall  },
+            { "octave_down",          kSchemaSmall  },
+            { "harmonizer",           kSchemaLarge  },
+            { "vocoder",              kSchemaLarge  },
+            { "formant_shift",        kSchemaMedium },
+            { "noise_gate",           kSchemaMedium },
+            { "spectral_gate",        kSchemaLarge  },
+            { "denoiser",             kSchemaLarge  },
+            { "monitor_mute",         nullptr       },
+        };
+
+        for (const auto& fx : FIXTURES) {
+            json effect(json::value_t::object);
+            effect["name"]     = fx.name;
+            effect["display"]  = fx.name;
+            effect["category"] = "modifier";
+
+            if (fx.schema && *fx.schema) {
+                const char* err = nullptr;
+                json params = json::parse(fx.schema, std::strlen(fx.schema),
+                                          nullptr, &err, nullptr);
+                if (params.is_null() || !params.is_array()) {
+                    effect["params"] = json(json::value_t::array);
+                } else {
+                    effect["params"] = params;
+                }
+            } else {
+                effect["params"] = json(json::value_t::array);
+            }
+            effects.push_back(effect);
+        }
+        snapshot["effects"] = effects;
+    }
+
+    /* If we got here without a crash, validate the structure end-to-end. */
+    ASSERT_TRUE(snapshot.is_object());
+    ASSERT_TRUE(snapshot.contains("limits"));
+    ASSERT_TRUE(snapshot.contains("effects"));
+    ASSERT_TRUE(snapshot.at("effects").is_array());
+    ASSERT_EQ(snapshot.at("effects").size(), 41u);
+
+    /* Walk every effect, read back name + params type — same access
+     * pattern handle_get_snapshot's dump() takes. */
+    for (size_t i = 0; i < snapshot.at("effects").size(); ++i) {
+        const json& e = snapshot.at("effects")[i];
+        ASSERT_TRUE(e.is_object()) << "effect " << i;
+        ASSERT_TRUE(e.contains("name"));
+        ASSERT_TRUE(e.contains("params"));
+        EXPECT_TRUE(e.at("name").is_string()) << "effect " << i;
+        EXPECT_TRUE(e.at("params").is_array()) << "effect " << i;
+    }
+
+    /* Final dump must succeed (this is what send_ok_with_data does on
+     * the device — and it touches every leaf). */
+    mcustl::string dumped = snapshot.dump(-1);
+    EXPECT_GT(dumped.size(), 0u);
+}
+
+/* Bisect: same loop body as the big repro. If this crashes / warns,
+ * the latent bug is in build-up-then-push-back of objects with
+ * parsed-schema values. */
+TEST_F(McustlTestFixture, JsonBuildEffectsRegistryRepro_NEffects) {
+    auto sanity_walk = [](const json& effects, const char* where, int round) {
+        for (size_t i = 0; i < effects.size(); ++i) {
+            const json& e = effects[i];
+            ASSERT_TRUE(e.is_object())
+                << where << " round=" << round << " i=" << i;
+            for (auto it = e.begin(); it != e.end(); ++it) {
+                const auto& k = it.key();
+                ASSERT_NE(k.c_str(), nullptr)
+                    << where << " round=" << round << " i=" << i
+                    << ": key.c_str() is NULL — bucket corrupted";
+                ASSERT_GT(k.size(), 0u)
+                    << where << " round=" << round << " i=" << i
+                    << ": key.size() == 0";
+            }
+        }
+    };
+
+    json effects(json::value_t::array);
+    for (int round = 0; round < 6; ++round) {
+        json effect(json::value_t::object);
+        effect["name"]     = "freq_shifter";
+        sanity_walk(effects, "after name", round);
+        effect["display"]  = "Frequency Shifter";
+        sanity_walk(effects, "after display", round);
+        effect["category"] = "modifier";
+        sanity_walk(effects, "after category", round);
+
+        json params = json::parse(kSchemaLarge, std::strlen(kSchemaLarge),
+                                  nullptr, nullptr, nullptr);
+        sanity_walk(effects, "after parse", round);
+
+        effect["params"] = params;
+        sanity_walk(effects, "after params assign", round);
+
+        effects.push_back(effect);
+        sanity_walk(effects, "after push_back", round);
+    }
+    EXPECT_EQ(effects.size(), 6u);
+}
+
+/* Minimal repro: the crash above narrows down to "object with a few
+ * string keys + parse a large schema + assign parsed result back into a
+ * key of that object". This isolates the bug from the loop noise. */
+TEST_F(McustlTestFixture, JsonObjectAssignParsedSchemaIntoExistingKey_Min) {
+    json effect(json::value_t::object);
+    effect["name"]     = "freq_shifter";
+    effect["display"]  = "Frequency Shifter";
+    effect["category"] = "modifier";
+
+    json params = json::parse(kSchemaLarge, std::strlen(kSchemaLarge),
+                              nullptr, nullptr, nullptr);
+    ASSERT_TRUE(params.is_array()) << "schema parse must succeed";
+
+    /* This is the line that crashed in the bigger test. */
+    effect["params"] = params;
+
+    /* Validate post-state. */
+    EXPECT_EQ(effect.size(), 4u);
+    ASSERT_TRUE(effect.contains("name"));
+    EXPECT_STREQ(effect.at("name").get_string().c_str(), "freq_shifter");
+    EXPECT_TRUE(effect.at("params").is_array());
+}
+
+/* Repeat the above many times in a single fixture lifetime. The device
+ * crash needed cumulative defrag activity to expose the latent issue —
+ * one round of buildEffectsRegistryJson likely won't do it. */
+TEST_F(McustlTestFixture, JsonBuildEffectsRegistryRepro_RepeatedRounds) {
+    for (int round = 0; round < 30; ++round) {
+        mcustl::heap_guard outer;
+
+        json snapshot;
+        {
+            mcustl::heap_guard inner;
+            snapshot = json(json::value_t::object);
+
+            {
+                json limits(json::value_t::object);
+                limits["max_modifiers_per_stream"] = 8;
+                snapshot["limits"] = limits;
+            }
+
+            json effects(json::value_t::array);
+
+            for (int k = 0; k < 6; ++k) {
+                json effect(json::value_t::object);
+                effect["name"]     = "pitch_down";
+                effect["display"]  = "Pitch Down";
+                effect["category"] = "modifier";
+
+                const char* schema =
+                    "[{\"name\":\"semitones\",\"type\":\"int\","
+                    "\"min\":-12,\"max\":12,\"default\":-3}]";
+                json params = json::parse(schema, std::strlen(schema),
+                                          nullptr, nullptr, nullptr);
+                effect["params"] = params;
+                effects.push_back(effect);
+            }
+            snapshot["effects"] = effects;
+        }
+
+        ASSERT_EQ(snapshot.at("effects").size(), 6u) << "round " << round;
+        mcustl::string dumped = snapshot.dump(-1);
+        EXPECT_GT(dumped.size(), 0u) << "round " << round;
+    }
+}

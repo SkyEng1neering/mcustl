@@ -89,3 +89,58 @@ target_compile_definitions(mcustl_tests PRIVATE
 # Enable CTest integration
 include(GoogleTest)
 gtest_discover_tests(mcustl_tests)
+
+# ============================================================================
+# Device-config test target — same sources, compiled with the alignment /
+# tracker-cap settings the device uses (see mcustl_device_conf.h). Catches
+# defrag bugs that only surface under the device's heap layout.
+# ============================================================================
+
+add_library(mcustl_alloc_dev STATIC ../src/mcustl_alloc.c)
+target_include_directories(mcustl_alloc_dev PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../inc
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_compile_definitions(mcustl_alloc_dev PUBLIC
+    MCUSTL_CUSTOM_CONF_FILE="mcustl_device_conf.h"
+)
+
+add_library(mcustl_string_dev STATIC ../src/mcustl_string.cpp)
+target_include_directories(mcustl_string_dev PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../inc
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(mcustl_string_dev PUBLIC mcustl_alloc_dev)
+target_compile_definitions(mcustl_string_dev PUBLIC
+    MCUSTL_CUSTOM_CONF_FILE="mcustl_device_conf.h"
+)
+
+add_library(mcustl_json_dev STATIC ../src/mcustl_json.cpp)
+target_include_directories(mcustl_json_dev PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../inc
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(mcustl_json_dev PUBLIC mcustl_string_dev mcustl_alloc_dev)
+target_compile_definitions(mcustl_json_dev PUBLIC
+    MCUSTL_CUSTOM_CONF_FILE="mcustl_device_conf.h"
+)
+
+add_executable(mcustl_device_tests
+    test_json.cpp
+    test_device_repro.cpp
+)
+target_link_libraries(mcustl_device_tests
+    mcustl_json_dev
+    mcustl_string_dev
+    mcustl_alloc_dev
+    GTest::gtest_main
+    Threads::Threads
+)
+target_include_directories(mcustl_device_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../inc
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_compile_definitions(mcustl_device_tests PRIVATE
+    MCUSTL_CUSTOM_CONF_FILE="mcustl_device_conf.h"
+)
+gtest_discover_tests(mcustl_device_tests TEST_PREFIX device.)

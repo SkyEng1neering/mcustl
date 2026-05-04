@@ -21,7 +21,7 @@
 #define ALLOCATION_ALIGNMENT_BYTES  8U
 
 /* Allow many allocations during JSON stress tests. */
-#define MAX_NUM_OF_ALLOCATIONS  500UL
+#define MAX_NUM_OF_ALLOCATIONS  16384UL
 
 /* Zero memory on free */
 #define FILL_FREED_MEMORY_BY_NULLS  true

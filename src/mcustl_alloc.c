@@ -17,7 +17,11 @@
 #include "mcustl_alloc.h"
 
 #ifdef USE_SINGLE_HEAP_MEMORY
-static heap_t default_heap;
+/* MCUSTL_DEFAULT_HEAP_ATTR allows the host project to relocate this
+ * struct into a specific RAM region — useful when the struct grows past
+ * the default .bss region's headroom (e.g. after bumping
+ * MAX_NUM_OF_ALLOCATIONS). Defaults to no attribute. */
+static MCUSTL_DEFAULT_HEAP_ATTR heap_t default_heap;
 static bool heap_registered = false;
 static void *registered_buffer = NULL;
 static uint32_t registered_size = 0;
@@ -165,12 +169,19 @@ void heap_init(heap_t* heap_struct_ptr, void *mem_ptr, uint32_t mem_size){
 	heap_struct_ptr->mem = (uint8_t*)mem_ptr;
 	heap_struct_ptr->total_size = mem_size;
 	heap_struct_ptr->alloc_info.allocations_num = 0;
+	heap_struct_ptr->alloc_info.pseudo_trackers_num = 0;
+	heap_struct_ptr->alloc_info.max_pseudo_trackers_amount = 0;
 	heap_struct_ptr->alloc_info.max_memory_amount = 0;
 	heap_struct_ptr->alloc_info.max_allocations_amount = 0;
 	for(uint32_t i = 0; i < MAX_NUM_OF_ALLOCATIONS; i++){
 		heap_struct_ptr->alloc_info.ptr_info_arr[i].ptr = NULL;
 		heap_struct_ptr->alloc_info.ptr_info_arr[i].allocated_size = 0;
 		heap_struct_ptr->alloc_info.ptr_info_arr[i].free_flag = true;
+	}
+	for(uint32_t i = 0; i < MAX_NUM_OF_PSEUDO_TRACKERS; i++){
+		heap_struct_ptr->alloc_info.pseudo_tracker_arr[i].ptr = NULL;
+		heap_struct_ptr->alloc_info.pseudo_tracker_arr[i].allocated_size = 0;
+		heap_struct_ptr->alloc_info.pseudo_tracker_arr[i].free_flag = true;
 	}
 	memset(heap_struct_ptr->mem, 0, heap_struct_ptr->total_size);
 #ifdef USE_THREAD_SAFETY
@@ -230,6 +241,11 @@ static void dalloc_internal(heap_t* heap_struct_ptr, uint32_t size, void **ptr){
 		if(heap_struct_ptr->alloc_info.allocations_num >= MAX_NUM_OF_ALLOCATIONS){
 			mcustl_debug("dalloc: Max number of allocations exceeded: %lu\n", (long unsigned int)heap_struct_ptr->alloc_info.allocations_num);
 		}
+		/* Loud project-side hook so the failure surfaces in release
+		 * builds where mcustl_debug is a no-op. Allocation cap or heap
+		 * exhaustion is the kind of bug the user otherwise has to chase
+		 * via downstream symptoms (truncated json, NULL deref, hang). */
+		MCUSTL_DALLOC_OVERFLOW_HOOK(heap_struct_ptr, size, new_offset);
 	}
 }
 
@@ -409,6 +425,18 @@ static void defrag_memory(heap_t* heap_struct_ptr){
                 *(heap_struct_ptr->alloc_info.ptr_info_arr[k3].ptr) -= alloc_size;
             }
         }
+        /* Same shift for pseudo-trackers (stack-local pointers that
+         * alias heap buffers — e.g. tracked_heap_ptr's snapshot of
+         * src.data()). Their `.ptr` storage lives on the stack so
+         * step 2 didn't apply, but their VALUE points into heap and
+         * must follow the memmove just like real-allocation values. */
+        for(uint32_t k3 = 0; k3 < heap_struct_ptr->alloc_info.pseudo_trackers_num; k3++){
+            uint8_t *val = *(heap_struct_ptr->alloc_info.pseudo_tracker_arr[k3].ptr);
+            size_t v = (size_t)val;
+            if(val > start_mem_ptr && v >= heap_lo && v < heap_hi){
+                *(heap_struct_ptr->alloc_info.pseudo_tracker_arr[k3].ptr) -= alloc_size;
+            }
+        }
 
         /* Step 5: remove the freed entry itself. */
         for(uint32_t k4 = i; k4 < heap_struct_ptr->alloc_info.allocations_num - 1; k4++){
@@ -503,20 +531,32 @@ void register_pseudo_tracker(heap_t *heap_struct_ptr, void **self_addr){
 #ifdef USE_THREAD_SAFETY
 	MCUSTL_MUTEX_LOCK(heap_struct_ptr->mutex);
 #endif
-	if(heap_struct_ptr->alloc_info.allocations_num < MAX_NUM_OF_ALLOCATIONS){
-		uint32_t i = heap_struct_ptr->alloc_info.allocations_num;
-		heap_struct_ptr->alloc_info.ptr_info_arr[i].ptr = (uint8_t**)self_addr;
-		heap_struct_ptr->alloc_info.ptr_info_arr[i].allocated_size = 0;
-		heap_struct_ptr->alloc_info.ptr_info_arr[i].free_flag = false;
-		heap_struct_ptr->alloc_info.allocations_num++;
-		if(heap_struct_ptr->alloc_info.allocations_num >
-		   heap_struct_ptr->alloc_info.max_allocations_amount){
-			heap_struct_ptr->alloc_info.max_allocations_amount =
-				heap_struct_ptr->alloc_info.allocations_num;
+	/* Pseudo-trackers live in a separate, dedicated array (see
+	 * mcustl_types.h). Sharing ptr_info_arr with real allocations would
+	 * let a transient burst of guards eat into the real-alloc cap; when
+	 * that cap is hit, register silently drops the entry, defrag stops
+	 * updating the stack-local pointer it was meant to track, and the
+	 * caller faults on the stale value. Keep the budgets independent. */
+	if(heap_struct_ptr->alloc_info.pseudo_trackers_num < MAX_NUM_OF_PSEUDO_TRACKERS){
+		uint32_t i = heap_struct_ptr->alloc_info.pseudo_trackers_num;
+		heap_struct_ptr->alloc_info.pseudo_tracker_arr[i].ptr = (uint8_t**)self_addr;
+		heap_struct_ptr->alloc_info.pseudo_tracker_arr[i].allocated_size = 0;
+		heap_struct_ptr->alloc_info.pseudo_tracker_arr[i].free_flag = false;
+		heap_struct_ptr->alloc_info.pseudo_trackers_num++;
+		if(heap_struct_ptr->alloc_info.pseudo_trackers_num >
+		   heap_struct_ptr->alloc_info.max_pseudo_trackers_amount){
+			heap_struct_ptr->alloc_info.max_pseudo_trackers_amount =
+				heap_struct_ptr->alloc_info.pseudo_trackers_num;
 		}
 	}
 	else {
-		mcustl_debug("register_pseudo_tracker: tracker array full\n");
+		/* This is a UAF latent bug — return without registering, defrag
+		 * won't update the stack-local pointer, and the next dereference
+		 * goes wild. Loud log so it's caught immediately on the device
+		 * side (mcustl_debug compiles out in release on most projects). */
+		mcustl_debug("register_pseudo_tracker: pseudo_tracker_arr full "
+		             "(bump MAX_NUM_OF_PSEUDO_TRACKERS)\n");
+		MCUSTL_PSEUDO_TRACKER_OVERFLOW_HOOK();
 	}
 #ifdef USE_THREAD_SAFETY
 	MCUSTL_MUTEX_UNLOCK(heap_struct_ptr->mutex);
@@ -530,16 +570,18 @@ void unregister_pseudo_tracker(heap_t *heap_struct_ptr, void **self_addr){
 #ifdef USE_THREAD_SAFETY
 	MCUSTL_MUTEX_LOCK(heap_struct_ptr->mutex);
 #endif
-	for(uint32_t i = heap_struct_ptr->alloc_info.allocations_num; i > 0; --i){
+	/* RAII gives LIFO order, so scan from the end. Match exactly on the
+	 * stored slot pointer — multiple guards may target distinct stack
+	 * slots, and the array does NOT preserve insertion order across
+	 * non-LIFO unregister patterns (rare but legal). */
+	for(uint32_t i = heap_struct_ptr->alloc_info.pseudo_trackers_num; i > 0; --i){
 		uint32_t idx = i - 1;
-		if(heap_struct_ptr->alloc_info.ptr_info_arr[idx].ptr == (uint8_t**)self_addr &&
-		   heap_struct_ptr->alloc_info.ptr_info_arr[idx].allocated_size == 0 &&
-		   heap_struct_ptr->alloc_info.ptr_info_arr[idx].free_flag == false){
-			for(uint32_t k = idx; k < heap_struct_ptr->alloc_info.allocations_num - 1; ++k){
-				heap_struct_ptr->alloc_info.ptr_info_arr[k] =
-					heap_struct_ptr->alloc_info.ptr_info_arr[k + 1];
+		if(heap_struct_ptr->alloc_info.pseudo_tracker_arr[idx].ptr == (uint8_t**)self_addr){
+			for(uint32_t k = idx; k < heap_struct_ptr->alloc_info.pseudo_trackers_num - 1; ++k){
+				heap_struct_ptr->alloc_info.pseudo_tracker_arr[k] =
+					heap_struct_ptr->alloc_info.pseudo_tracker_arr[k + 1];
 			}
-			heap_struct_ptr->alloc_info.allocations_num--;
+			heap_struct_ptr->alloc_info.pseudo_trackers_num--;
 			break;
 		}
 	}
