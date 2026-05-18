@@ -155,4 +155,67 @@ private:
     SelfT* self = this;                                                 \
     ::mcustl::tracked_this<SelfT> _mcustl_self_track_(self, (heap_expr))
 
+namespace mcustl {
+
+/**
+ * @brief mcustl::tracked_heap_ptr — RAII pseudo-tracker for a stack-local
+ * pointer that aliases a heap buffer.
+ *
+ * Solves the "stale stack snapshot" problem: code that takes a pointer into a
+ * heap-tracked buffer (e.g. `const char* p = some_str.c_str()`) and then
+ * triggers — directly or transitively — a dfree+defrag while still using `p`
+ * will read garbage. mcustl's tracker updates the string's internal `data_`,
+ * but the stack-local `p` snapshot is not a tracker and is not touched.
+ *
+ * tracked_heap_ptr registers `&p` as a *pseudo-tracker*. Pseudo-trackers
+ * carry no allocation; defrag's value-shift pass updates their stored
+ * pointer value whenever the heap bytes they alias move. After the guard's
+ * scope ends, the slot is unregistered.
+ *
+ * Pass the heap that owns the buffer `*ptr_slot` points into. If null
+ * (pre-allocation lazy state), the default heap is used — that's where
+ * mcustl tracks the buffer in single-heap mode anyway. If `*ptr_slot` is
+ * null, registration is skipped (nothing to track).
+ *
+ * Usage pattern:
+ * @code
+ *   bool MyWrapper::configure(const char* json, size_t len) {
+ *       // Caller's json points into a mcustl::string. Any heap work
+ *       // below may defrag and move that string's buffer — register
+ *       // &json so mcustl keeps it valid.
+ *       mcustl::tracked_heap_ptr _tp(mcustl_get_default_heap(), &json);
+ *
+ *       reallocBuffersForNewFftSize();   // triggers dfree → defrag
+ *       return DelegateBase::configure(json, len);   // json still valid
+ *   }
+ * @endcode
+ */
+class tracked_heap_ptr {
+public:
+    tracked_heap_ptr(heap_t* h, const char** ptr_slot) noexcept
+        : slot_(reinterpret_cast<void**>(const_cast<char**>(ptr_slot))) {
+        if (!slot_ || !*slot_) return;
+        heap_ = h ? h : mcustl_get_default_heap();
+        if (!heap_) return;
+        register_pseudo_tracker(heap_, slot_);
+        armed_ = true;
+    }
+    ~tracked_heap_ptr() noexcept {
+        if (armed_) {
+            unregister_pseudo_tracker(heap_, slot_);
+        }
+    }
+    tracked_heap_ptr(const tracked_heap_ptr&)            = delete;
+    tracked_heap_ptr& operator=(const tracked_heap_ptr&) = delete;
+    tracked_heap_ptr(tracked_heap_ptr&&)                 = delete;
+    tracked_heap_ptr& operator=(tracked_heap_ptr&&)      = delete;
+
+private:
+    void**  slot_;
+    heap_t* heap_  = nullptr;
+    bool    armed_ = false;
+};
+
+} /* namespace mcustl */
+
 #endif /* MCUSTL_GUARD_H */

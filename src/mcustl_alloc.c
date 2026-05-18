@@ -590,8 +590,28 @@ void unregister_pseudo_tracker(heap_t *heap_struct_ptr, void **self_addr){
 #endif
 }
 
+/* Caller passed NULL — typically a container default-constructed
+ * pre-main (before mcustl_register_heap), whose alloc_mem_ptr never
+ * got lazy-rebound. Fall back to the default heap so the lock/unlock
+ * pair stays balanced even when an inner lazy-init (e.g.
+ * vector::reserve_new_memory rewriting alloc_mem_ptr from NULL to
+ * the default heap between the lock and the unlock) would otherwise
+ * leave one side as a no-op and the other as a real take/give.
+ *
+ * The classic symptom of the unbalanced pair is one extra give that
+ * decrements the caller's outer heap_guard recursion count to zero,
+ * surrendering the mutex to whichever task wakes next — yielding an
+ * AB-BA deadlock with the audio path that holds ChainLock.
+ *
+ * Only meaningful in single-heap mode; multi-heap callers pass a
+ * specific heap and a NULL there is genuine misuse worth surfacing. */
 void heap_lock(heap_t *heap_struct_ptr){
 #ifdef USE_THREAD_SAFETY
+#ifdef USE_SINGLE_HEAP_MEMORY
+	if(heap_struct_ptr == NULL){
+		heap_struct_ptr = mcustl_get_default_heap();
+	}
+#endif
 	if(heap_struct_ptr){
 		MCUSTL_MUTEX_LOCK(heap_struct_ptr->mutex);
 	}
@@ -602,6 +622,11 @@ void heap_lock(heap_t *heap_struct_ptr){
 
 void heap_unlock(heap_t *heap_struct_ptr){
 #ifdef USE_THREAD_SAFETY
+#ifdef USE_SINGLE_HEAP_MEMORY
+	if(heap_struct_ptr == NULL){
+		heap_struct_ptr = mcustl_get_default_heap();
+	}
+#endif
 	if(heap_struct_ptr){
 		MCUSTL_MUTEX_UNLOCK(heap_struct_ptr->mutex);
 	}

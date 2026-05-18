@@ -798,6 +798,104 @@ TEST_F(McustlTestFixture, HeapGuardByPointer) {
     EXPECT_EQ(v[0], 99);
 }
 
+/* Regression: heap_lock/unlock must auto-fall-back to the default heap
+ * when called with a NULL heap pointer. Without that, a container that
+ * was default-constructed pre-main (mcustl_register_heap hadn't run yet,
+ * so its stored alloc_mem_ptr was NULL) survives by lazily re-binding
+ * inside reserve_new_memory — but then the entry-side heap_lock(NULL)
+ * is a no-op while the exit-side heap_unlock(now-non-NULL) fires a real
+ * give. Net is one extra release per such call.
+ *
+ * Exciter-mini lived with that for a long time because the give merely
+ * lowered the recursive count, never paired with a problem. The bomb
+ * went off the first time an outer mcustl::heap_guard wrapped the call
+ * (ModifierChain::add taking heap_guard before calling
+ * modifiers_.reserve() on the just-created `usb_in` chain): the outer
+ * count dropped from 1 to 0 mid-method, the audio thread woke, took
+ * heap_guard around modifierChain_.apply(), then waited on ChainLock —
+ * which the RPC task still held. Classic AB-BA, hard to spot from logs
+ * because both halves looked legitimate.
+ *
+ * This test reproduces the exact mechanic on the host:
+ *   1. force a vector's alloc_mem_ptr to NULL (simulating pre-main ctor)
+ *   2. take an outer heap_guard
+ *   3. trigger reserve() — the formerly-unbalanced pair
+ *   4. ask a foreign thread whether the mutex is still held
+ *
+ * If reserve() leaked one give, the foreign thread's pthread_mutex_trylock
+ * succeeds and the test fails. With the fallback in heap_lock, both
+ * sides operate on the default heap and the pair stays balanced.
+ *
+ * Same shape covers map / string / list because they all funnel
+ * through the same heap_lock/heap_unlock helpers. */
+TEST_F(McustlTestFixture, HeapGuardSurvivesLazyInitInReserve) {
+    mcustl::vector<int> vec;
+    vec.assign_mem_pointer(nullptr);
+    ASSERT_EQ(vec.get_mem_pointer(), nullptr)
+        << "Test setup: expected NULL heap ptr on the vector";
+
+    pthread_mutex_t* m = mcustl_get_default_heap()->mutex;
+    ASSERT_NE(m, nullptr);
+
+    mcustl::heap_guard outer;   // outer take: count 0 -> 1, holder = this thread
+    ASSERT_TRUE(vec.reserve(8));
+    EXPECT_NE(vec.get_mem_pointer(), nullptr)
+        << "reserve() should have lazy-bound the heap ptr";
+
+    /* Foreign thread: trylock from a non-owning context. With the bug
+     * the mutex was silently surrendered during reserve() and a
+     * foreign thread could grab it. With the fix it stays ours. */
+    std::atomic<bool> foreign_got_lock{false};
+    std::thread other([m, &foreign_got_lock]() {
+        if (pthread_mutex_trylock(m) == 0) {
+            foreign_got_lock = true;
+            pthread_mutex_unlock(m);
+        }
+    });
+    other.join();
+
+    EXPECT_FALSE(foreign_got_lock.load())
+        << "After vector::reserve() on a NULL-heap vector, the outer "
+        << "heap_guard's mutex was prematurely released — that is the "
+        << "exciter-mini bt_task/stream_task AB-BA deadlock root cause";
+
+    /* Sanity: vector still functional through the formerly-broken path. */
+    EXPECT_TRUE(vec.push_back(42));
+    EXPECT_EQ(vec[0], 42);
+}
+
+/* Same balance check for the other lazy-init entry point — push_back on
+ * an empty vector also routes through reserve_new_memory. Cheap to
+ * cover separately so a future change that only patches reserve()
+ * doesn't silently regress push_back. */
+TEST_F(McustlTestFixture, HeapGuardSurvivesLazyInitInPushBack) {
+    mcustl::vector<int> vec;
+    vec.assign_mem_pointer(nullptr);
+    ASSERT_EQ(vec.get_mem_pointer(), nullptr);
+
+    pthread_mutex_t* m = mcustl_get_default_heap()->mutex;
+    ASSERT_NE(m, nullptr);
+
+    mcustl::heap_guard outer;
+    ASSERT_TRUE(vec.push_back(7));
+
+    std::atomic<bool> foreign_got_lock{false};
+    std::thread other([m, &foreign_got_lock]() {
+        if (pthread_mutex_trylock(m) == 0) {
+            foreign_got_lock = true;
+            pthread_mutex_unlock(m);
+        }
+    });
+    other.join();
+
+    EXPECT_FALSE(foreign_got_lock.load())
+        << "push_back() on NULL-heap vector silently released the outer "
+        << "heap_guard's mutex";
+
+    EXPECT_EQ(vec.size(), 1u);
+    EXPECT_EQ(vec[0], 7);
+}
+
 TEST_F(McustlTestFixture, Stress_AllContainersRepeatedCreateDestroy) {
     for (int round = 0; round < 5; round++) {
         {

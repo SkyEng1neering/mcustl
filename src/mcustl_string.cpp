@@ -22,40 +22,8 @@
 
 namespace mcustl {
 
-/* RAII pseudo-tracker for a stack-local pointer that aliases a heap
- * buffer. Defrag's value-shift pass keeps `*ptr_slot` valid across any
- * dfree+memmove triggered while the guard is alive — without this, a
- * `const char* p = src.data()` snapshot at the start of a copy/append
- * loop goes stale the first time push_back grows.
- *
- * Pass the heap that owns the buffer `*ptr_slot` points into. If null
- * (pre-allocation lazy state), we fall back to the default heap, which
- * is where mcustl tracks the buffer in single-heap mode anyway. If
- * `*ptr_slot` itself is null (empty source), we skip registration —
- * the caller's loop will execute zero iterations and there's nothing
- * to track. */
-class tracked_heap_ptr {
-public:
-    tracked_heap_ptr(heap_t* h, const char** ptr_slot) noexcept
-        : slot_(reinterpret_cast<void**>(const_cast<char**>(ptr_slot))) {
-        if (!slot_ || !*slot_) return;
-        heap_ = h ? h : mcustl_get_default_heap();
-        if (!heap_) return;
-        register_pseudo_tracker(heap_, slot_);
-        armed_ = true;
-    }
-    ~tracked_heap_ptr() noexcept {
-        if (armed_) {
-            unregister_pseudo_tracker(heap_, slot_);
-        }
-    }
-    tracked_heap_ptr(const tracked_heap_ptr&)            = delete;
-    tracked_heap_ptr& operator=(const tracked_heap_ptr&) = delete;
-private:
-    void**  slot_;
-    heap_t* heap_  = nullptr;
-    bool    armed_ = false;
-};
+/* tracked_heap_ptr lives in mcustl_guard.h — used here and by external
+ * project-side wrappers that snapshot a heap pointer across a dfree. */
 
 char& string::at(uint32_t i){
 	return ch_container.at(i);
